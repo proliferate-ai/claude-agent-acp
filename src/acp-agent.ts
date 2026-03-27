@@ -124,6 +124,31 @@ type Session = {
   abortController: AbortController;
 };
 
+type LegacySessionStateChangedMessage = {
+  type: "system";
+  subtype: "session_state_changed";
+  state: string;
+  session_id: string;
+};
+
+type LegacyApiRetryMessage = {
+  type: "system";
+  subtype: "api_retry";
+  session_id: string;
+};
+
+function isLegacySessionStateChangedMessage(
+  message: { type: "system"; subtype: string },
+): message is LegacySessionStateChangedMessage {
+  return message.subtype === "session_state_changed";
+}
+
+function isLegacyApiRetryMessage(
+  message: { type: "system"; subtype: string },
+): message is LegacyApiRetryMessage {
+  return message.subtype === "api_retry";
+}
+
 type BackgroundTerminal =
   | {
       handle: TerminalHandle;
@@ -510,67 +535,73 @@ export class ClaudeAcpAgent implements Agent {
         }
 
         switch (message.type) {
-          case "system":
-            switch (message.subtype) {
-              case "init":
-                break;
-              case "status": {
-                if (message.status === "compacting") {
-                  await this.client.sessionUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "Compacting..." },
-                    },
-                  });
-                }
-                break;
-              }
-              case "compact_boundary": {
-                // We don't know the exact size, but since we compacted,
-                // we set it to zero. The client gets the exact size on the next message.
-                lastAssistantTotalUsage = 0;
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: "\n\nCompacting completed." },
-                  },
-                });
-                break;
-              }
-              case "local_command_output": {
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: message.content },
-                  },
-                });
-                break;
-              }
-              case "session_state_changed": {
-                if (message.state === "idle") {
-                  return { stopReason, usage: sessionUsage(session) };
-                }
-                break;
-              }
-              case "hook_started":
-              case "hook_progress":
-              case "hook_response":
-              case "files_persisted":
-              case "task_started":
-              case "task_notification":
-              case "task_progress":
-              case "elicitation_complete":
-              case "api_retry":
-                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
-                break;
-              default:
-                unreachable(message, this.logger);
-                break;
+          case "system": {
+            const systemMessage = message as
+              | typeof message
+              | LegacySessionStateChangedMessage
+              | LegacyApiRetryMessage;
+
+            if (systemMessage.subtype === "init") {
+              break;
             }
+            if (systemMessage.subtype === "status") {
+              if (systemMessage.status === "compacting") {
+                await this.client.sessionUpdate({
+                  sessionId: systemMessage.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: "Compacting..." },
+                  },
+                });
+              }
+              break;
+            }
+            if (systemMessage.subtype === "compact_boundary") {
+              // We don't know the exact size, but since we compacted,
+              // we set it to zero. The client gets the exact size on the next message.
+              lastAssistantTotalUsage = 0;
+              await this.client.sessionUpdate({
+                sessionId: systemMessage.session_id,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: "\n\nCompacting completed." },
+                },
+              });
+              break;
+            }
+            if (systemMessage.subtype === "local_command_output") {
+              await this.client.sessionUpdate({
+                sessionId: systemMessage.session_id,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: systemMessage.content },
+                },
+              });
+              break;
+            }
+            if (isLegacySessionStateChangedMessage(systemMessage)) {
+              if (systemMessage.state === "idle") {
+                return { stopReason, usage: sessionUsage(session) };
+              }
+              break;
+            }
+            if (
+              systemMessage.subtype === "hook_started" ||
+              systemMessage.subtype === "hook_progress" ||
+              systemMessage.subtype === "hook_response" ||
+              systemMessage.subtype === "files_persisted" ||
+              systemMessage.subtype === "task_started" ||
+              systemMessage.subtype === "task_notification" ||
+              systemMessage.subtype === "task_progress" ||
+              systemMessage.subtype === "elicitation_complete" ||
+              isLegacyApiRetryMessage(systemMessage)
+            ) {
+              // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+              break;
+            }
+            unreachable(systemMessage as never, this.logger);
             break;
+          }
           case "result": {
             // Accumulate usage from this result
             session.accumulatedUsage.inputTokens += message.usage.input_tokens;
