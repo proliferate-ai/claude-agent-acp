@@ -33,32 +33,127 @@ const MOCK_MODELS = {
   ],
 };
 
-const MOCK_CONFIG_OPTIONS = [
+type TestModelCapabilitiesById = Record<
+  string,
   {
-    id: "mode",
-    name: "Mode",
-    type: "select",
-    category: "mode",
-    currentValue: "default",
-    options: MOCK_MODES.availableModes.map((m) => ({
-      value: m.id,
-      name: m.name,
-      description: m.description,
-    })),
+    supportsEffort: boolean;
+    supportedEffortLevels: string[];
+    supportsAdaptiveThinking: boolean;
+    supportsFastMode: boolean;
+  }
+>;
+
+const NO_REASONING_MODEL_CAPABILITIES: TestModelCapabilitiesById = {
+  "claude-opus-4-5": {
+    supportsEffort: false,
+    supportedEffortLevels: [],
+    supportsAdaptiveThinking: false,
+    supportsFastMode: false,
   },
-  {
-    id: "model",
-    name: "Model",
-    type: "select",
-    category: "model",
-    currentValue: "claude-opus-4-5",
-    options: MOCK_MODELS.availableModels.map((m) => ({
-      value: m.modelId,
-      name: m.name,
-      description: m.description,
-    })),
+  "claude-sonnet-4-5": {
+    supportsEffort: false,
+    supportedEffortLevels: [],
+    supportsAdaptiveThinking: false,
+    supportsFastMode: false,
   },
-];
+};
+
+const DYNAMIC_MODEL_CAPABILITIES: TestModelCapabilitiesById = {
+  "claude-opus-4-5": {
+    supportsEffort: true,
+    supportedEffortLevels: ["low", "medium", "high"],
+    supportsAdaptiveThinking: true,
+    supportsFastMode: true,
+  },
+  "claude-sonnet-4-5": {
+    supportsEffort: false,
+    supportedEffortLevels: [],
+    supportsAdaptiveThinking: false,
+    supportsFastMode: false,
+  },
+};
+
+function createConfigOptions(params?: {
+  currentModeId?: string;
+  currentModelId?: string;
+  includeReasoning?: boolean;
+  thinkingCurrentValue?: "on" | "off";
+  effortCurrentValue?: "low" | "medium" | "high";
+  fastModeCurrentValue?: "on" | "off";
+}) {
+  const currentModeId = params?.currentModeId ?? MOCK_MODES.currentModeId;
+  const currentModelId = params?.currentModelId ?? MOCK_MODELS.currentModelId;
+  const configOptions = [
+    {
+      id: "mode",
+      name: "Mode",
+      type: "select" as const,
+      category: "mode",
+      currentValue: currentModeId,
+      options: MOCK_MODES.availableModes.map((m) => ({
+        value: m.id,
+        name: m.name,
+        description: m.description,
+      })),
+    },
+    {
+      id: "model",
+      name: "Model",
+      type: "select" as const,
+      category: "model",
+      currentValue: currentModelId,
+      options: MOCK_MODELS.availableModels.map((m) => ({
+        value: m.modelId,
+        name: m.name,
+        description: m.description,
+      })),
+    },
+  ];
+
+  if (!params?.includeReasoning) {
+    return configOptions;
+  }
+
+  return [
+    ...configOptions,
+    {
+      id: "thinking",
+      name: "Thinking",
+      type: "select" as const,
+      category: "_thinking",
+      currentValue: params.thinkingCurrentValue ?? "on",
+      options: [
+        { value: "on", name: "On" },
+        { value: "off", name: "Off" },
+      ],
+    },
+    {
+      id: "effort",
+      name: "Effort",
+      type: "select" as const,
+      category: "thought_level",
+      currentValue: params.effortCurrentValue ?? "medium",
+      options: [
+        { value: "low", name: "Low" },
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+    {
+      id: "fast_mode",
+      name: "Fast Mode",
+      type: "select" as const,
+      category: "_fast_mode",
+      currentValue: params.fastModeCurrentValue ?? "off",
+      options: [
+        { value: "off", name: "Off" },
+        { value: "on", name: "On" },
+      ],
+    },
+  ];
+}
+
+const MOCK_CONFIG_OPTIONS = createConfigOptions();
 
 describe("session config options", () => {
   let agent: ClaudeAcpAgentType;
@@ -67,6 +162,9 @@ describe("session config options", () => {
   let createSessionSpy: ReturnType<typeof vi.fn>;
   let setPermissionModeSpy: ReturnType<typeof vi.fn>;
   let setModelSpy: ReturnType<typeof vi.fn>;
+  let applyFlagSettingsSpy: ReturnType<typeof vi.fn>;
+  let getSettingsSpy: ReturnType<typeof vi.fn>;
+  let currentSettings: Record<string, unknown>;
 
   function createMockClient(): AgentSideConnection {
     return {
@@ -79,21 +177,58 @@ describe("session config options", () => {
     } as unknown as AgentSideConnection;
   }
 
-  function populateSession() {
+  function populateSession(params?: {
+    currentModelId?: string;
+    currentModeId?: string;
+    modelCapabilitiesById?: TestModelCapabilitiesById;
+    configOptions?: ReturnType<typeof createConfigOptions>;
+    settings?: Record<string, unknown>;
+  }) {
+    currentSettings = { ...(params?.settings ?? {}) };
     setPermissionModeSpy = vi.fn();
     setModelSpy = vi.fn();
+    applyFlagSettingsSpy = vi.fn(async (settingsPatch: Record<string, unknown>) => {
+      currentSettings = {
+        ...currentSettings,
+        ...settingsPatch,
+      };
+    });
+    getSettingsSpy = vi.fn(async () => ({ ...currentSettings }));
 
     (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
       query: {
         setPermissionMode: setPermissionModeSpy,
         setModel: setModelSpy,
+        applyFlagSettings: applyFlagSettingsSpy,
+        getSettings: getSettingsSpy,
         supportedCommands: async () => [],
       },
       input: null,
       cancelled: false,
-      permissionMode: "default",
-      settingsManager: {},
-      configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
+      cwd: "/test",
+      settingsManager: {
+        dispose: () => {},
+      },
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      modes: {
+        ...MOCK_MODES,
+        currentModeId: params?.currentModeId ?? MOCK_MODES.currentModeId,
+      },
+      models: {
+        ...MOCK_MODELS,
+        currentModelId: params?.currentModelId ?? MOCK_MODELS.currentModelId,
+      },
+      modelCapabilitiesById: params?.modelCapabilitiesById ?? NO_REASONING_MODEL_CAPABILITIES,
+      configOptions: structuredClone(params?.configOptions ?? MOCK_CONFIG_OPTIONS),
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
     };
   }
 
@@ -119,22 +254,18 @@ describe("session config options", () => {
   describe("newSession returns configOptions", () => {
     it("includes configOptions in the response", async () => {
       const response = await agent.newSession({ cwd: "/test", mcpServers: [] });
-      expect(response.configOptions).toBeDefined();
       expect(response.configOptions).toEqual(MOCK_CONFIG_OPTIONS);
     });
 
     it("includes mode and model config options", async () => {
       const response = await agent.newSession({ cwd: "/test", mcpServers: [] });
-      const modeOption = response.configOptions?.find((o) => o.id === "mode");
-      const modelOption = response.configOptions?.find((o) => o.id === "model");
-      expect(modeOption).toBeDefined();
-      expect(modelOption).toBeDefined();
+      expect(response.configOptions?.find((o) => o.id === "mode")).toBeDefined();
+      expect(response.configOptions?.find((o) => o.id === "model")).toBeDefined();
     });
   });
 
   describe("loadSession returns configOptions", () => {
     it("includes configOptions from createSession", async () => {
-      // loadSession calls findSessionFile first - override the whole method
       const loadSessionSpy = vi.fn(async () => ({
         modes: MOCK_MODES,
         models: MOCK_MODELS,
@@ -217,11 +348,9 @@ describe("session config options", () => {
       });
 
       expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
-
-      const configUpdate = sessionUpdates.find(
-        (n) => n.update.sessionUpdate === "config_option_update",
-      );
-      expect(configUpdate).toBeUndefined();
+      expect(
+        sessionUpdates.find((n) => n.update.sessionUpdate === "config_option_update"),
+      ).toBeUndefined();
     });
 
     it("resolves model alias 'opus' to full model ID", async () => {
@@ -232,9 +361,9 @@ describe("session config options", () => {
       });
 
       expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-5");
-
-      const modelOption = response.configOptions.find((o) => o.id === "model");
-      expect(modelOption?.currentValue).toBe("claude-opus-4-5");
+      expect(response.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-opus-4-5",
+      );
     });
 
     it("resolves model alias 'sonnet' to full model ID", async () => {
@@ -265,8 +394,9 @@ describe("session config options", () => {
       });
 
       expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
-      const modelOption = response.configOptions.find((o) => o.id === "model");
-      expect(modelOption?.currentValue).toBe("claude-sonnet-4-5");
+      expect(response.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-sonnet-4-5",
+      );
     });
 
     it("throws for completely invalid model value", async () => {
@@ -287,8 +417,7 @@ describe("session config options", () => {
       });
 
       expect(response.configOptions).toHaveLength(MOCK_CONFIG_OPTIONS.length);
-      const modeOption = response.configOptions.find((o) => o.id === "mode");
-      expect(modeOption?.currentValue).toBe("plan");
+      expect(response.configOptions.find((o) => o.id === "mode")?.currentValue).toBe("plan");
     });
 
     it("other options are unchanged when one is updated", async () => {
@@ -298,8 +427,108 @@ describe("session config options", () => {
         value: "plan",
       });
 
-      const modelOption = response.configOptions.find((o) => o.id === "model");
-      expect(modelOption?.currentValue).toBe("claude-opus-4-5");
+      expect(response.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-opus-4-5",
+      );
+    });
+  });
+
+  describe("reasoning config options", () => {
+    beforeEach(() => {
+      populateSession({
+        modelCapabilitiesById: DYNAMIC_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions({
+          includeReasoning: true,
+          thinkingCurrentValue: "on",
+          effortCurrentValue: "medium",
+          fastModeCurrentValue: "off",
+        }),
+        settings: {
+          alwaysThinkingEnabled: true,
+          effortLevel: "medium",
+          fastMode: false,
+        },
+      });
+    });
+
+    it("sets thinking via applyFlagSettings", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "thinking",
+        value: "off",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        alwaysThinkingEnabled: false,
+      });
+      expect(response.configOptions.find((o) => o.id === "thinking")?.currentValue).toBe("off");
+    });
+
+    it("sets effort via applyFlagSettings", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "high",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        effortLevel: "high",
+      });
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
+    });
+
+    it("sets fast mode via applyFlagSettings", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "fast_mode",
+        value: "on",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        fastMode: true,
+      });
+      expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("on");
+    });
+
+    it("removes dependent controls when switching to a model without reasoning features", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-5",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+      expect(response.configOptions.map((o) => o.id)).toEqual(["mode", "model"]);
+    });
+
+    it("adds dependent controls and coerces effort when switching to a reasoning model", async () => {
+      populateSession({
+        currentModelId: "claude-sonnet-4-5",
+        modelCapabilitiesById: DYNAMIC_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions({
+          currentModelId: "claude-sonnet-4-5",
+        }),
+        settings: {},
+      });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-5");
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        effortLevel: "high",
+      });
+      expect(response.configOptions.map((o) => o.id)).toEqual([
+        "mode",
+        "model",
+        "thinking",
+        "effort",
+        "fast_mode",
+      ]);
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
     });
   });
 
@@ -314,7 +543,6 @@ describe("session config options", () => {
       const configUpdate = sessionUpdates.find(
         (n) => n.update.sessionUpdate === "config_option_update",
       );
-      expect(configUpdate).toBeDefined();
       expect(configUpdate?.update).toMatchObject({
         sessionUpdate: "config_option_update",
         configOptions: expect.arrayContaining([
@@ -331,8 +559,7 @@ describe("session config options", () => {
           sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
         }
       ).sessions[SESSION_ID];
-      const modeOption = session.configOptions.find((o) => o.id === "mode");
-      expect(modeOption?.currentValue).toBe("plan");
+      expect(session.configOptions.find((o) => o.id === "mode")?.currentValue).toBe("plan");
     });
 
     it("does not send config_option_update for an invalid mode", async () => {
@@ -340,10 +567,9 @@ describe("session config options", () => {
         agent.setSessionMode({ sessionId: SESSION_ID, modeId: "not-a-mode" as any }),
       ).rejects.toThrow("Invalid Mode");
 
-      const configUpdate = sessionUpdates.find(
-        (n) => n.update.sessionUpdate === "config_option_update",
-      );
-      expect(configUpdate).toBeUndefined();
+      expect(
+        sessionUpdates.find((n) => n.update.sessionUpdate === "config_option_update"),
+      ).toBeUndefined();
     });
   });
 
@@ -361,7 +587,6 @@ describe("session config options", () => {
       const configUpdate = sessionUpdates.find(
         (n) => n.update.sessionUpdate === "config_option_update",
       );
-      expect(configUpdate).toBeDefined();
       expect(configUpdate?.update).toMatchObject({
         sessionUpdate: "config_option_update",
         configOptions: expect.arrayContaining([
@@ -381,14 +606,25 @@ describe("session config options", () => {
           sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
         }
       ).sessions[SESSION_ID];
-      const modelOption = session.configOptions.find((o) => o.id === "model");
-      expect(modelOption?.currentValue).toBe("claude-sonnet-4-5");
+      expect(session.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-sonnet-4-5",
+      );
     });
   });
 
   describe("no config_option_update notification when using setSessionConfigOption", () => {
     beforeEach(() => {
-      populateSession();
+      populateSession({
+        modelCapabilitiesById: DYNAMIC_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions({
+          includeReasoning: true,
+        }),
+        settings: {
+          alwaysThinkingEnabled: true,
+          effortLevel: "medium",
+          fastMode: false,
+        },
+      });
     });
 
     it("sends no config_option_update when setting mode via config option", async () => {
@@ -398,10 +634,9 @@ describe("session config options", () => {
         value: "plan",
       });
 
-      const configUpdates = sessionUpdates.filter(
-        (n) => n.update.sessionUpdate === "config_option_update",
-      );
-      expect(configUpdates).toHaveLength(0);
+      expect(
+        sessionUpdates.filter((n) => n.update.sessionUpdate === "config_option_update"),
+      ).toHaveLength(0);
     });
 
     it("sends no config_option_update when setting model via config option", async () => {
@@ -411,10 +646,21 @@ describe("session config options", () => {
         value: "claude-sonnet-4-5",
       });
 
-      const configUpdates = sessionUpdates.filter(
-        (n) => n.update.sessionUpdate === "config_option_update",
-      );
-      expect(configUpdates).toHaveLength(0);
+      expect(
+        sessionUpdates.filter((n) => n.update.sessionUpdate === "config_option_update"),
+      ).toHaveLength(0);
+    });
+
+    it("sends no config_option_update when setting thinking via config option", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "thinking",
+        value: "off",
+      });
+
+      expect(
+        sessionUpdates.filter((n) => n.update.sessionUpdate === "config_option_update"),
+      ).toHaveLength(0);
     });
   });
 

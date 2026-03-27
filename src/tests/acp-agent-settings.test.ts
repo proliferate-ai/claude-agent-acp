@@ -30,14 +30,26 @@ describe("ClaudeAcpAgent settings", () => {
     } as unknown as AgentSideConnection;
   }
 
-  function mockQuery() {
+  function mockQuery(params?: {
+    models?: any[];
+    initialSettings?: Record<string, unknown>;
+  }) {
     let capturedOptions: any;
+    let currentSettings = { ...(params?.initialSettings ?? {}) };
     const setModelSpy = vi.fn();
+    const applyFlagSettingsSpy = vi.fn(async (settingsPatch: Record<string, unknown>) => {
+      currentSettings = {
+        ...currentSettings,
+        ...settingsPatch,
+      };
+    });
+    const getSettingsSpy = vi.fn(async () => ({ ...currentSettings }));
+
     querySpy.mockImplementation(({ options }: any) => {
       capturedOptions = options;
       return {
         initializationResult: async () => ({
-          models: [
+          models: params?.models ?? [
             {
               value: "claude-sonnet-4-5",
               displayName: "Claude Sonnet 4.5",
@@ -46,10 +58,19 @@ describe("ClaudeAcpAgent settings", () => {
           ],
         }),
         setModel: setModelSpy,
+        applyFlagSettings: applyFlagSettingsSpy,
+        getSettings: getSettingsSpy,
         supportedCommands: async () => [],
       } as any;
     });
-    return { getCapturedOptions: () => capturedOptions, setModelSpy };
+
+    return {
+      getCapturedOptions: () => capturedOptions,
+      setModelSpy,
+      applyFlagSettingsSpy,
+      getSettingsSpy,
+      getCurrentSettings: () => ({ ...currentSettings }),
+    };
   }
 
   beforeEach(async () => {
@@ -183,26 +204,19 @@ describe("ClaudeAcpAgent settings", () => {
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(projectDir, { recursive: true });
 
-    const setModelSpy = vi.fn();
-    querySpy.mockImplementation(({ options: _options }: any) => {
-      return {
-        initializationResult: async () => ({
-          models: [
-            {
-              value: "claude-opus-4-6",
-              displayName: "Claude Opus 4.6",
-              description: "Base",
-            },
-            {
-              value: "claude-opus-4-6-1m",
-              displayName: "Claude Opus 4.6 (1M)",
-              description: "Long context",
-            },
-          ],
-        }),
-        setModel: setModelSpy,
-        supportedCommands: async () => [],
-      } as any;
+    const { setModelSpy } = mockQuery({
+      models: [
+        {
+          value: "claude-opus-4-6",
+          displayName: "Claude Opus 4.6",
+          description: "Base",
+        },
+        {
+          value: "claude-opus-4-6-1m",
+          displayName: "Claude Opus 4.6 (1M)",
+          description: "Long context",
+        },
+      ],
     });
 
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
@@ -216,5 +230,119 @@ describe("ClaudeAcpAgent settings", () => {
 
     expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
     expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
+  });
+
+  it("includes thinking, effort, and fast mode config options when supported", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    mockQuery({
+      models: [
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Default",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high", "max"],
+          supportsAdaptiveThinking: true,
+          supportsFastMode: true,
+        },
+      ],
+      initialSettings: {
+        alwaysThinkingEnabled: false,
+        effortLevel: "medium",
+        fastMode: true,
+      },
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(response.configOptions.map((option: any) => option.id)).toEqual([
+      "mode",
+      "model",
+      "thinking",
+      "effort",
+      "fast_mode",
+    ]);
+    expect(response.configOptions.find((option: any) => option.id === "thinking")?.currentValue).toBe(
+      "off",
+    );
+    expect(response.configOptions.find((option: any) => option.id === "effort")?.currentValue).toBe(
+      "medium",
+    );
+    expect(
+      response.configOptions.find((option: any) => option.id === "fast_mode")?.currentValue,
+    ).toBe("on");
+  });
+
+  it("omits reasoning controls for models that do not support them", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    mockQuery({
+      models: [
+        {
+          value: "claude-haiku-4-5",
+          displayName: "Claude Haiku 4.5",
+          description: "Fast",
+        },
+      ],
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(response.configOptions.map((option: any) => option.id)).toEqual(["mode", "model"]);
+  });
+
+  it("coerces unsupported effort values to a supported live value", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { applyFlagSettingsSpy, getCurrentSettings } = mockQuery({
+      models: [
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Default",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium"],
+          supportsAdaptiveThinking: true,
+        },
+      ],
+      initialSettings: {
+        effortLevel: "high",
+      },
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+      effortLevel: "low",
+    });
+    expect(getCurrentSettings().effortLevel).toBe("low");
+    expect(response.configOptions.find((option: any) => option.id === "effort")?.currentValue).toBe(
+      "low",
+    );
   });
 });
