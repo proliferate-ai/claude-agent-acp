@@ -990,6 +990,14 @@ export class ClaudeAcpAgent implements Agent {
     // Use the canonical option value so downstream code always receives the
     // model ID rather than the caller-supplied alias.
     const resolvedValue = validValue.value;
+    this.logger.log("[config] setSessionConfigOption request", {
+      sessionId: params.sessionId,
+      configId: params.configId,
+      requestedValue: params.value,
+      resolvedValue,
+      currentValues: summarizeConfigOptionValues(session.configOptions),
+      liveSettings: session.liveSettings,
+    });
 
     switch (params.configId) {
       case "mode":
@@ -1045,6 +1053,13 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     const configOptions = await this.rebuildSessionConfigOptions(session);
+    this.logger.log("[config] setSessionConfigOption response", {
+      sessionId: params.sessionId,
+      configId: params.configId,
+      resolvedValue,
+      liveSettings: session.liveSettings,
+      rebuiltValues: summarizeConfigOptionValues(configOptions),
+    });
     return { configOptions };
   }
 
@@ -1276,7 +1291,15 @@ export class ClaudeAcpAgent implements Agent {
       session.modelCapabilitiesById,
       settings,
     );
+    session.liveSettings = settings;
     session.configOptions = configOptions;
+    this.logger.log("[config] rebuildSessionConfigOptions", {
+      sessionId: Object.entries(this.sessions).find(([, candidate]) => candidate === session)?.[0] ?? null,
+      modelId: session.models.currentModelId,
+      modeId: session.modes.currentModeId,
+      liveSettings: session.liveSettings,
+      rebuiltValues: summarizeConfigOptionValues(configOptions),
+    });
     return configOptions;
   }
 
@@ -1670,6 +1693,19 @@ async function getQuerySettings(query: MutableQuery): Promise<Settings> {
   }
 
   return await query.getSettings();
+}
+
+function summarizeConfigOptionValues(configOptions: SessionConfigOption[]): Record<string, string> {
+  const summary: Record<string, string> = {};
+
+  for (const option of configOptions) {
+    if (!("type" in option) || option.type !== "select") {
+      continue;
+    }
+    summary[option.id] = option.currentValue;
+  }
+
+  return summary;
 }
 
 function buildConfigOptions(
