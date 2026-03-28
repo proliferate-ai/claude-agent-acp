@@ -141,6 +141,7 @@ type Session = {
   modes: SessionModeState;
   models: SessionModelState;
   modelCapabilitiesById: ModelCapabilitiesById;
+  liveSettings: Settings;
   configOptions: SessionConfigOption[];
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
@@ -1016,16 +1017,28 @@ export class ClaudeAcpAgent implements Agent {
         await session.query.applyFlagSettings({
           alwaysThinkingEnabled: resolvedValue === "on",
         });
+        session.liveSettings = {
+          ...session.liveSettings,
+          alwaysThinkingEnabled: resolvedValue === "on",
+        };
         break;
       case "effort":
         await session.query.applyFlagSettings({
           effortLevel: resolvedValue as LiveEffortLevel,
         });
+        session.liveSettings = {
+          ...session.liveSettings,
+          effortLevel: resolvedValue as LiveEffortLevel,
+        };
         break;
       case "fast_mode":
         await session.query.applyFlagSettings({
           fastMode: resolvedValue === "on",
         });
+        session.liveSettings = {
+          ...session.liveSettings,
+          fastMode: resolvedValue === "on",
+        };
         break;
       default:
         throw new Error(`Unknown config option: ${params.configId}`);
@@ -1283,11 +1296,7 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   private async getNormalizedSessionSettings(session: Session): Promise<Settings> {
-    if (typeof session.query.getSettings !== "function") {
-      return {};
-    }
-
-    let settings = await session.query.getSettings();
+    let settings = { ...session.liveSettings };
     const currentCapabilities = session.modelCapabilitiesById[session.models.currentModelId];
     const supportedEffortLevels = getLiveEffortLevels(currentCapabilities);
 
@@ -1308,7 +1317,11 @@ export class ClaudeAcpAgent implements Agent {
     await session.query.applyFlagSettings({
       effortLevel: preferredEffortLevel,
     });
-    settings = await session.query.getSettings();
+    settings = {
+      ...settings,
+      effortLevel: preferredEffortLevel,
+    };
+    session.liveSettings = settings;
     return settings;
   }
 
@@ -1605,6 +1618,7 @@ export class ClaudeAcpAgent implements Agent {
       modes,
       models,
       modelCapabilitiesById: capabilitiesById,
+      liveSettings: await getQuerySettings(q),
       configOptions: [],
       promptRunning: false,
       pendingMessages: new Map(),
@@ -1648,6 +1662,14 @@ function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
       .join("\n"),
     ANTHROPIC_AUTH_TOKEN: "", // Must be specified to bypass claude login requirement
   };
+}
+
+async function getQuerySettings(query: MutableQuery): Promise<Settings> {
+  if (typeof query.getSettings !== "function") {
+    return {};
+  }
+
+  return await query.getSettings();
 }
 
 function buildConfigOptions(

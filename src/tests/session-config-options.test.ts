@@ -183,15 +183,18 @@ describe("session config options", () => {
     modelCapabilitiesById?: TestModelCapabilitiesById;
     configOptions?: ReturnType<typeof createConfigOptions>;
     settings?: Record<string, unknown>;
+    keepGetSettingsStale?: boolean;
   }) {
     currentSettings = { ...(params?.settings ?? {}) };
     setPermissionModeSpy = vi.fn();
     setModelSpy = vi.fn();
     applyFlagSettingsSpy = vi.fn(async (settingsPatch: Record<string, unknown>) => {
-      currentSettings = {
-        ...currentSettings,
-        ...settingsPatch,
-      };
+      if (!params?.keepGetSettingsStale) {
+        currentSettings = {
+          ...currentSettings,
+          ...settingsPatch,
+        };
+      }
     });
     getSettingsSpy = vi.fn(async () => ({ ...currentSettings }));
 
@@ -224,6 +227,7 @@ describe("session config options", () => {
         currentModelId: params?.currentModelId ?? MOCK_MODELS.currentModelId,
       },
       modelCapabilitiesById: params?.modelCapabilitiesById ?? NO_REASONING_MODEL_CAPABILITIES,
+      liveSettings: { ...currentSettings },
       configOptions: structuredClone(params?.configOptions ?? MOCK_CONFIG_OPTIONS),
       promptRunning: false,
       pendingMessages: new Map(),
@@ -464,6 +468,33 @@ describe("session config options", () => {
       expect(response.configOptions.find((o) => o.id === "thinking")?.currentValue).toBe("off");
     });
 
+    it("returns updated thinking state even when getSettings readback is stale", async () => {
+      populateSession({
+        modelCapabilitiesById: DYNAMIC_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions({
+          includeReasoning: true,
+          thinkingCurrentValue: "on",
+          effortCurrentValue: "medium",
+          fastModeCurrentValue: "off",
+        }),
+        settings: {
+          alwaysThinkingEnabled: true,
+          effortLevel: "medium",
+          fastMode: false,
+        },
+        keepGetSettingsStale: true,
+      });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "thinking",
+        value: "off",
+      });
+
+      expect(getSettingsSpy).not.toHaveBeenCalled();
+      expect(response.configOptions.find((o) => o.id === "thinking")?.currentValue).toBe("off");
+    });
+
     it("sets effort via applyFlagSettings", async () => {
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -477,6 +508,33 @@ describe("session config options", () => {
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
     });
 
+    it("returns updated effort state even when getSettings readback is stale", async () => {
+      populateSession({
+        modelCapabilitiesById: DYNAMIC_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions({
+          includeReasoning: true,
+          thinkingCurrentValue: "on",
+          effortCurrentValue: "medium",
+          fastModeCurrentValue: "off",
+        }),
+        settings: {
+          alwaysThinkingEnabled: true,
+          effortLevel: "medium",
+          fastMode: false,
+        },
+        keepGetSettingsStale: true,
+      });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "high",
+      });
+
+      expect(getSettingsSpy).not.toHaveBeenCalled();
+      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
+    });
+
     it("sets fast mode via applyFlagSettings", async () => {
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -487,6 +545,33 @@ describe("session config options", () => {
       expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
         fastMode: true,
       });
+      expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("on");
+    });
+
+    it("returns updated fast mode state even when getSettings readback is stale", async () => {
+      populateSession({
+        modelCapabilitiesById: DYNAMIC_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions({
+          includeReasoning: true,
+          thinkingCurrentValue: "on",
+          effortCurrentValue: "medium",
+          fastModeCurrentValue: "off",
+        }),
+        settings: {
+          alwaysThinkingEnabled: true,
+          effortLevel: "medium",
+          fastMode: false,
+        },
+        keepGetSettingsStale: true,
+      });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "fast_mode",
+        value: "on",
+      });
+
+      expect(getSettingsSpy).not.toHaveBeenCalled();
       expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("on");
     });
 
