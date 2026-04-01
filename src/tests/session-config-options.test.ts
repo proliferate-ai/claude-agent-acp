@@ -73,11 +73,25 @@ const DYNAMIC_MODEL_CAPABILITIES: TestModelCapabilitiesById = {
   },
 };
 
+const ADAPTIVE_ONLY_MODEL_CAPABILITIES: TestModelCapabilitiesById = {
+  "claude-opus-4-5": {
+    supportsEffort: false,
+    supportedEffortLevels: [],
+    supportsAdaptiveThinking: true,
+    supportsFastMode: false,
+  },
+  "claude-sonnet-4-5": {
+    supportsEffort: false,
+    supportedEffortLevels: [],
+    supportsAdaptiveThinking: false,
+    supportsFastMode: false,
+  },
+};
+
 function createConfigOptions(params?: {
   currentModeId?: string;
   currentModelId?: string;
   includeReasoning?: boolean;
-  thinkingCurrentValue?: "on" | "off";
   effortCurrentValue?: "low" | "medium" | "high";
   fastModeCurrentValue?: "on" | "off";
 }) {
@@ -116,17 +130,6 @@ function createConfigOptions(params?: {
 
   return [
     ...configOptions,
-    {
-      id: "thinking",
-      name: "Thinking",
-      type: "select" as const,
-      category: "_thinking",
-      currentValue: params.thinkingCurrentValue ?? "on",
-      options: [
-        { value: "on", name: "On" },
-        { value: "off", name: "Off" },
-      ],
-    },
     {
       id: "effort",
       name: "Effort",
@@ -439,7 +442,6 @@ describe("session config options", () => {
         modelCapabilitiesById: DYNAMIC_MODEL_CAPABILITIES,
         configOptions: createConfigOptions({
           includeReasoning: true,
-          thinkingCurrentValue: "on",
           effortCurrentValue: "medium",
           fastModeCurrentValue: "off",
         }),
@@ -449,19 +451,6 @@ describe("session config options", () => {
           fastMode: false,
         },
       });
-    });
-
-    it("sets thinking via applyFlagSettings", async () => {
-      const response = await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "thinking",
-        value: "off",
-      });
-
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
-        alwaysThinkingEnabled: false,
-      });
-      expect(response.configOptions.find((o) => o.id === "thinking")?.currentValue).toBe("off");
     });
 
     it("sets effort via applyFlagSettings", async () => {
@@ -475,6 +464,16 @@ describe("session config options", () => {
         effortLevel: "high",
       });
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
+    });
+
+    it("rejects stale thinking config mutations", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "thinking",
+          value: "off",
+        }),
+      ).rejects.toThrow("Unknown config option: thinking");
     });
 
     it("sets fast mode via applyFlagSettings", async () => {
@@ -519,16 +518,41 @@ describe("session config options", () => {
 
       expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-5");
       expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        alwaysThinkingEnabled: true,
         effortLevel: "high",
       });
       expect(response.configOptions.map((o) => o.id)).toEqual([
         "mode",
         "model",
-        "thinking",
         "effort",
         "fast_mode",
       ]);
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("high");
+    });
+
+    it("forces thinking on for adaptive-only reasoning models without exposing controls", async () => {
+      populateSession({
+        modelCapabilitiesById: ADAPTIVE_ONLY_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions(),
+        settings: {
+          alwaysThinkingEnabled: false,
+        },
+      });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-5");
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        alwaysThinkingEnabled: true,
+      });
+      expect(response.configOptions.map((o) => o.id)).toEqual([
+        "mode",
+        "model",
+      ]);
     });
   });
 
@@ -651,11 +675,11 @@ describe("session config options", () => {
       ).toHaveLength(0);
     });
 
-    it("sends no config_option_update when setting thinking via config option", async () => {
+    it("sends no config_option_update when setting effort via config option", async () => {
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
-        configId: "thinking",
-        value: "off",
+        configId: "effort",
+        value: "high",
       });
 
       expect(

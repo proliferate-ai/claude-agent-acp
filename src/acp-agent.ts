@@ -1012,11 +1012,6 @@ export class ClaudeAcpAgent implements Agent {
           currentModelId: resolvedValue,
         };
         break;
-      case "thinking":
-        await session.query.applyFlagSettings({
-          alwaysThinkingEnabled: resolvedValue === "on",
-        });
-        break;
       case "effort":
         await session.query.applyFlagSettings({
           effortLevel: resolvedValue as LiveEffortLevel,
@@ -1289,25 +1284,35 @@ export class ClaudeAcpAgent implements Agent {
 
     let settings = await session.query.getSettings();
     const currentCapabilities = session.modelCapabilitiesById[session.models.currentModelId];
+    const reasoningCapable = supportsReasoningControls(currentCapabilities);
     const supportedEffortLevels = getLiveEffortLevels(currentCapabilities);
 
-    if (supportedEffortLevels.length === 0 || typeof session.query.applyFlagSettings !== "function") {
+    if (!reasoningCapable || typeof session.query.applyFlagSettings !== "function") {
       return settings;
+    }
+
+    const nextSettings: Partial<Settings> = {};
+
+    if (settings.alwaysThinkingEnabled !== true) {
+      nextSettings.alwaysThinkingEnabled = true;
     }
 
     if (
+      supportedEffortLevels.length > 0
+      && !(
       settings.effortLevel !== undefined &&
       supportedEffortLevels.includes(settings.effortLevel as LiveEffortLevel)
-    ) {
+    )) {
+      nextSettings.effortLevel = supportedEffortLevels.includes("high")
+        ? "high"
+        : supportedEffortLevels[0];
+    }
+
+    if (Object.keys(nextSettings).length === 0) {
       return settings;
     }
 
-    const preferredEffortLevel = supportedEffortLevels.includes("high")
-      ? "high"
-      : supportedEffortLevels[0];
-    await session.query.applyFlagSettings({
-      effortLevel: preferredEffortLevel,
-    });
+    await session.query.applyFlagSettings(nextSettings);
     settings = await session.query.getSettings();
     return settings;
   }
@@ -1686,27 +1691,6 @@ function buildConfigOptions(
   ];
 
   const currentCapabilities = modelCapabilitiesById[models.currentModelId];
-  if (supportsReasoningControls(currentCapabilities)) {
-    configOptions.push({
-      id: "thinking",
-      name: "Thinking",
-      description: "Enable or disable Claude thinking",
-      category: "_thinking",
-      type: "select",
-      currentValue: settings.alwaysThinkingEnabled === false ? "off" : "on",
-      options: [
-        {
-          value: "on",
-          name: "On",
-        },
-        {
-          value: "off",
-          name: "Off",
-        },
-      ],
-    });
-  }
-
   const effortLevels = getLiveEffortLevels(currentCapabilities);
   if (effortLevels.length > 0) {
     const currentEffortLevel = effortLevels.includes(settings.effortLevel as LiveEffortLevel)
@@ -1831,11 +1815,13 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
 ): Promise<AvailableModelsResult> {
   const settings = settingsManager.getSettings();
+  const visibleModels = models.filter((model) => model.value !== "default");
+  const selectableModels = visibleModels.length > 0 ? visibleModels : models;
 
-  let currentModel = models[0];
+  let currentModel = selectableModels[0];
 
   if (settings.model) {
-    const match = resolveModelPreference(models, settings.model);
+    const match = resolveModelPreference(selectableModels, settings.model);
     if (match) {
       currentModel = match;
     }
@@ -1845,7 +1831,7 @@ async function getAvailableModels(
 
   return {
     state: {
-      availableModels: models.map((model) => ({
+      availableModels: selectableModels.map((model) => ({
         modelId: model.value,
         name: model.displayName,
         description: model.description,
@@ -1853,7 +1839,7 @@ async function getAvailableModels(
       currentModelId: currentModel.value,
     },
     capabilitiesById: Object.fromEntries(
-      models.map((model) => [
+      selectableModels.map((model) => [
         model.value,
         {
           supportsEffort: model.supportsEffort ?? false,

@@ -232,11 +232,52 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
   });
 
-  it("includes thinking, effort, and fast mode config options when supported", async () => {
+  it("hides the default model and picks the first concrete Claude model", async () => {
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(projectDir, { recursive: true });
 
-    mockQuery({
+    const { setModelSpy } = mockQuery({
+      models: [
+        {
+          value: "default",
+          displayName: "Auto",
+          description: "Automatic model selection",
+        },
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Balanced",
+        },
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus 4.5",
+          description: "Most capable",
+        },
+      ],
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+    expect(response.models.currentModelId).toBe("claude-sonnet-4-5");
+    expect(response.models.availableModels.map((model: { modelId: string }) => model.modelId)).toEqual([
+      "claude-sonnet-4-5",
+      "claude-opus-4-5",
+    ]);
+  });
+
+  it("includes effort and fast mode config options and normalizes thinking on", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { applyFlagSettingsSpy, getCurrentSettings } = mockQuery({
       models: [
         {
           value: "claude-sonnet-4-5",
@@ -267,19 +308,59 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.configOptions.map((option: any) => option.id)).toEqual([
       "mode",
       "model",
-      "thinking",
       "effort",
       "fast_mode",
     ]);
-    expect(response.configOptions.find((option: any) => option.id === "thinking")?.currentValue).toBe(
-      "off",
-    );
     expect(response.configOptions.find((option: any) => option.id === "effort")?.currentValue).toBe(
       "medium",
     );
     expect(
       response.configOptions.find((option: any) => option.id === "fast_mode")?.currentValue,
     ).toBe("on");
+    expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+      alwaysThinkingEnabled: true,
+    });
+    expect(getCurrentSettings().alwaysThinkingEnabled).toBe(true);
+  });
+
+  it("forces thinking on for adaptive-thinking models without exposing a reasoning control", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { applyFlagSettingsSpy, getCurrentSettings } = mockQuery({
+      models: [
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Default",
+          supportsEffort: false,
+          supportedEffortLevels: [],
+          supportsAdaptiveThinking: true,
+          supportsFastMode: false,
+        },
+      ],
+      initialSettings: {
+        alwaysThinkingEnabled: false,
+      },
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(response.configOptions.map((option: any) => option.id)).toEqual([
+      "mode",
+      "model",
+    ]);
+    expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+      alwaysThinkingEnabled: true,
+    });
+    expect(getCurrentSettings().alwaysThinkingEnabled).toBe(true);
   });
 
   it("omits reasoning controls for models that do not support them", async () => {
@@ -338,8 +419,10 @@ describe("ClaudeAcpAgent settings", () => {
     });
 
     expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+      alwaysThinkingEnabled: true,
       effortLevel: "low",
     });
+    expect(getCurrentSettings().alwaysThinkingEnabled).toBe(true);
     expect(getCurrentSettings().effortLevel).toBe("low");
     expect(response.configOptions.find((option: any) => option.id === "effort")?.currentValue).toBe(
       "low",
