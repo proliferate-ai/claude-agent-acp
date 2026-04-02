@@ -110,6 +110,10 @@ type AccumulatedUsage = {
 };
 
 type SupportedEffortLevel = "low" | "medium" | "high" | "max";
+// TODO: The SDK's startup Options/EffortLevel surface includes "max", but the
+// public live-update Settings.effortLevel type still stops at "high". Keep ACP
+// live config limited to values the documented mid-session applyFlagSettings()
+// path supports until Anthropic exposes "max" there as well.
 type LiveEffortLevel = Exclude<SupportedEffortLevel, "max">;
 
 type ModelCapabilities = {
