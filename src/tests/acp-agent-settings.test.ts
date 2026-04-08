@@ -33,9 +33,11 @@ describe("ClaudeAcpAgent settings", () => {
   function mockQuery(params?: {
     models?: any[];
     initialSettings?: Record<string, unknown>;
+    settingsResponseShape?: "flat" | "effective";
   }) {
     let capturedOptions: any;
     let currentSettings = { ...(params?.initialSettings ?? {}) };
+    const settingsResponseShape = params?.settingsResponseShape ?? "flat";
     const setModelSpy = vi.fn();
     const applyFlagSettingsSpy = vi.fn(async (settingsPatch: Record<string, unknown>) => {
       currentSettings = {
@@ -43,7 +45,11 @@ describe("ClaudeAcpAgent settings", () => {
         ...settingsPatch,
       };
     });
-    const getSettingsSpy = vi.fn(async () => ({ ...currentSettings }));
+    const getSettingsSpy = vi.fn(async () =>
+      settingsResponseShape === "effective"
+        ? { effective: { ...currentSettings } }
+        : { ...currentSettings },
+    );
 
     querySpy.mockImplementation(({ options }: any) => {
       capturedOptions = options;
@@ -321,6 +327,50 @@ describe("ClaudeAcpAgent settings", () => {
       alwaysThinkingEnabled: true,
     });
     expect(getCurrentSettings().alwaysThinkingEnabled).toBe(true);
+  });
+
+  it("reads effort and fast mode from wrapped effective settings responses", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { applyFlagSettingsSpy } = mockQuery({
+      models: [
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Default",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high", "max"],
+          supportsAdaptiveThinking: true,
+          supportsFastMode: true,
+        },
+      ],
+      initialSettings: {
+        alwaysThinkingEnabled: false,
+        effortLevel: "medium",
+        fastMode: true,
+      },
+      settingsResponseShape: "effective",
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(response.configOptions.find((option: any) => option.id === "effort")?.currentValue).toBe(
+      "medium",
+    );
+    expect(
+      response.configOptions.find((option: any) => option.id === "fast_mode")?.currentValue,
+    ).toBe("on");
+    expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+      alwaysThinkingEnabled: true,
+    });
   });
 
   it("forces thinking on for adaptive-thinking models without exposing a reasoning control", async () => {

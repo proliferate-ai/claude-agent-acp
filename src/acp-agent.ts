@@ -132,8 +132,24 @@ type AvailableModelsResult = {
 
 type MutableQuery = Query & {
   applyFlagSettings(settings: Partial<Settings>): Promise<void>;
-  getSettings(): Promise<Settings>;
+  getSettings(): Promise<SessionSettingsResult>;
 };
+
+type SessionSettingsEnvelope = {
+  effective?: Settings;
+  sources?: unknown;
+  applied?: unknown;
+};
+
+type SessionSettingsResult = Settings | SessionSettingsEnvelope;
+
+function unwrapEffectiveSettings(result: SessionSettingsResult | null | undefined): Settings {
+  if (result && typeof result === "object" && "effective" in result) {
+    return (result.effective ?? {}) as Settings;
+  }
+
+  return (result ?? {}) as Settings;
+}
 
 type Session = {
   query: MutableQuery;
@@ -1286,7 +1302,7 @@ export class ClaudeAcpAgent implements Agent {
       return {};
     }
 
-    let settings = await session.query.getSettings();
+    let settings = unwrapEffectiveSettings(await session.query.getSettings());
     const currentCapabilities = session.modelCapabilitiesById[session.models.currentModelId];
     const reasoningCapable = supportsReasoningControls(currentCapabilities);
     const supportedEffortLevels = getLiveEffortLevels(currentCapabilities);
@@ -1317,7 +1333,7 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     await session.query.applyFlagSettings(nextSettings);
-    settings = await session.query.getSettings();
+    settings = unwrapEffectiveSettings(await session.query.getSettings());
     return settings;
   }
 

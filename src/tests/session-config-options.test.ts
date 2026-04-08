@@ -186,8 +186,10 @@ describe("session config options", () => {
     modelCapabilitiesById?: TestModelCapabilitiesById;
     configOptions?: ReturnType<typeof createConfigOptions>;
     settings?: Record<string, unknown>;
+    settingsResponseShape?: "flat" | "effective";
   }) {
     currentSettings = { ...(params?.settings ?? {}) };
+    const settingsResponseShape = params?.settingsResponseShape ?? "flat";
     setPermissionModeSpy = vi.fn();
     setModelSpy = vi.fn();
     applyFlagSettingsSpy = vi.fn(async (settingsPatch: Record<string, unknown>) => {
@@ -196,7 +198,11 @@ describe("session config options", () => {
         ...settingsPatch,
       };
     });
-    getSettingsSpy = vi.fn(async () => ({ ...currentSettings }));
+    getSettingsSpy = vi.fn(async () =>
+      settingsResponseShape === "effective"
+        ? { effective: { ...currentSettings } }
+        : { ...currentSettings },
+    );
 
     (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
       query: {
@@ -487,6 +493,39 @@ describe("session config options", () => {
         fastMode: true,
       });
       expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("on");
+    });
+
+    it("rebuilds effort and fast mode from wrapped effective settings", async () => {
+      populateSession({
+        modelCapabilitiesById: DYNAMIC_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions({
+          includeReasoning: true,
+          effortCurrentValue: "medium",
+          fastModeCurrentValue: "off",
+        }),
+        settings: {
+          alwaysThinkingEnabled: true,
+          effortLevel: "medium",
+          fastMode: false,
+        },
+        settingsResponseShape: "effective",
+      });
+
+      const effortResponse = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+      const fastModeResponse = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "fast_mode",
+        value: "on",
+      });
+
+      expect(effortResponse.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
+      expect(fastModeResponse.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe(
+        "on",
+      );
     });
 
     it("removes dependent controls when switching to a model without reasoning features", async () => {
