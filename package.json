@@ -38,6 +38,7 @@
     "test:integration": "RUN_INTEGRATION_TESTS=true vitest run",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
