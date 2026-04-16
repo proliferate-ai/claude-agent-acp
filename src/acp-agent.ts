@@ -243,6 +243,7 @@ type Session = {
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   cwd: string;
+  activeAssistantMessageId: string | null;
   /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
    *  detect when loadSession/resumeSession is called with changed values. */
   sessionFingerprint: string;
@@ -1041,6 +1042,10 @@ export class ClaudeAcpAgent implements Agent {
             break;
           }
           case "stream_event": {
+            if (message.event.type === "message_start") {
+              session.activeAssistantMessageId = `claude:${message.event.message.id}`;
+            }
+
             if (
               message.parent_tool_use_id === null &&
               (message.event.type === "message_start" || message.event.type === "message_delta")
@@ -1101,9 +1106,14 @@ export class ClaudeAcpAgent implements Agent {
               {
                 clientCapabilities: this.clientCapabilities,
                 cwd: session.cwd,
+                activeAssistantMessageId: session.activeAssistantMessageId,
               },
             )) {
               await this.client.sessionUpdate(notification);
+            }
+
+            if (message.event.type === "message_stop") {
+              session.activeAssistantMessageId = null;
             }
             break;
           }
@@ -1282,6 +1292,7 @@ export class ClaudeAcpAgent implements Agent {
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
+        session.activeAssistantMessageId = null;
         // This usually should not happen, but in case the loop finishes
         // without claude sending all message replays, we resolve the
         // next pending prompt call to ensure no prompts get stuck.
@@ -2021,6 +2032,7 @@ export class ClaudeAcpAgent implements Agent {
       input: input,
       cancelled: false,
       cwd: params.cwd,
+      activeAssistantMessageId: null,
       sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,
       accumulatedUsage: {
@@ -2671,10 +2683,11 @@ export function streamEventToAcpNotifications(
   options?: {
     clientCapabilities?: ClientCapabilities;
     cwd?: string;
+    activeAssistantMessageId?: string | null;
   },
 ): SessionNotification[] {
   const event = message.event;
-  const assistantMessageId = `claude:${message.uuid}`;
+  const assistantMessageId = options?.activeAssistantMessageId ?? `claude:${message.uuid}`;
   const contentBlockIndex = "index" in event && typeof event.index === "number" ? event.index : 0;
   switch (event.type) {
     case "content_block_start": {

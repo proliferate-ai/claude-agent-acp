@@ -24,7 +24,13 @@ import {
   toolUpdateFromToolResult,
   toolUpdateFromEditToolResponse,
 } from "../tools.js";
-import { toAcpNotifications, promptToClaude, ClaudeAcpAgent, claudeCliPath } from "../acp-agent.js";
+import {
+  toAcpNotifications,
+  streamEventToAcpNotifications,
+  promptToClaude,
+  ClaudeAcpAgent,
+  claudeCliPath,
+} from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
@@ -722,6 +728,142 @@ describe("tool conversions", () => {
     ]);
   });
 
+  it("should group streamed text and thinking chunks by message_start id", () => {
+    let activeAssistantMessageId: string | null = null;
+    const convert = (message: any) => {
+      if (message.event.type === "message_start") {
+        activeAssistantMessageId = `claude:${message.event.message.id}`;
+      }
+      const notifications = streamEventToAcpNotifications(
+        message,
+        "test",
+        {},
+        {} as AgentSideConnection,
+        console,
+        { activeAssistantMessageId },
+      );
+      if (message.event.type === "message_stop") {
+        activeAssistantMessageId = null;
+      }
+      return notifications;
+    };
+
+    expect(
+      convert({
+        type: "stream_event",
+        event: {
+          type: "message_start",
+          message: { id: "msg_123" },
+        },
+        parent_tool_use_id: null,
+        session_id: "test",
+        uuid: "uuid-start",
+      }),
+    ).toStrictEqual([]);
+
+    const firstText = convert({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Hey" },
+      },
+      parent_tool_use_id: null,
+      session_id: "test",
+      uuid: "uuid-text-1",
+    });
+    const secondText = convert({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "! What are you working on?" },
+      },
+      parent_tool_use_id: null,
+      session_id: "test",
+      uuid: "uuid-text-2",
+    });
+    const thinking = convert({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "Thinking" },
+      },
+      parent_tool_use_id: null,
+      session_id: "test",
+      uuid: "uuid-thinking",
+    });
+    const completion = convert({
+      type: "stream_event",
+      event: { type: "message_stop" },
+      parent_tool_use_id: null,
+      session_id: "test",
+      uuid: "uuid-stop",
+    });
+
+    expect(firstText[0]?.update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      messageId: "claude:msg_123",
+      content: { type: "text", text: "Hey" },
+    });
+    expect(secondText[0]?.update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      messageId: "claude:msg_123",
+      content: { type: "text", text: "! What are you working on?" },
+    });
+    expect(thinking[0]?.update).toMatchObject({
+      sessionUpdate: "agent_thought_chunk",
+      messageId: "claude:msg_123:thinking:0",
+      content: { type: "text", text: "Thinking" },
+    });
+    expect(completion).toStrictEqual([
+      {
+        sessionId: "test",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "claude:msg_123",
+          content: {
+            type: "text",
+            text: "",
+          },
+          _meta: {
+            anyharness: {
+              transcriptEvent: "assistant_message_completed",
+            },
+          },
+        },
+      },
+    ]);
+    expect(activeAssistantMessageId).toBeNull();
+  });
+
+  it("should fall back to stream event uuid when content arrives without message_start", () => {
+    const notifications = streamEventToAcpNotifications(
+      {
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "fallback" },
+        },
+        parent_tool_use_id: null,
+        session_id: "test",
+        uuid: "uuid-fallback",
+      } as any,
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+    );
+
+    expect(notifications[0]?.update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      messageId: "claude:uuid-fallback",
+      content: { type: "text", text: "fallback" },
+    });
+  });
+
   it("should return empty update for successful edit result", () => {
     const toolUse = {
       type: "tool_use",
@@ -1328,6 +1470,7 @@ describe("stop reason propagation", () => {
       input,
       cancelled: false,
       cwd: "/test",
+      activeAssistantMessageId: null,
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
         currentModeId: "default",
@@ -1471,6 +1614,7 @@ describe("stop reason propagation", () => {
       cwd: "/tmp/test",
       sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
       cancelled: false,
+      activeAssistantMessageId: null,
       modes: {
         currentModeId: "default",
         availableModes: [],
@@ -1546,6 +1690,7 @@ describe("session/close", () => {
       input: new Pushable(),
       cancelled: false,
       cwd: "/test",
+      activeAssistantMessageId: null,
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
         currentModeId: "default",
@@ -1644,6 +1789,7 @@ describe("getOrCreateSession param change detection", () => {
       input: new Pushable(),
       cancelled: false,
       cwd,
+      activeAssistantMessageId: null,
       sessionFingerprint: JSON.stringify({
         cwd,
         mcpServers: [...mcpServers].sort((a: any, b: any) => a.name.localeCompare(b.name)),
@@ -1874,6 +2020,7 @@ describe("usage_update computation", () => {
       input,
       cancelled: false,
       cwd: "/test",
+      activeAssistantMessageId: null,
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
         currentModeId: "default",
@@ -1899,6 +2046,91 @@ describe("usage_update computation", () => {
       contextWindowSize: 200000,
     };
   }
+
+  it("uses message_start id for streamed chunks in the prompt loop", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: "uuid-start",
+        session_id: "test-session",
+        event: {
+          type: "message_start",
+          message: {
+            id: "msg_123",
+            model: "claude-opus-4-20250514",
+            usage: {
+              input_tokens: 10,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        },
+      },
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: "uuid-text-1",
+        session_id: "test-session",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "H" },
+        },
+      },
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: "uuid-text-2",
+        session_id: "test-session",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "i" },
+        },
+      },
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: "uuid-stop",
+        session_id: "test-session",
+        event: { type: "message_stop" },
+      },
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-20250514": {
+            inputTokens: 10,
+            outputTokens: 2,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const agentChunks = updates.filter(
+      (u: any) => u.update?.sessionUpdate === "agent_message_chunk",
+    );
+    expect(agentChunks.map((u: any) => u.update.messageId)).toStrictEqual([
+      "claude:msg_123",
+      "claude:msg_123",
+      "claude:msg_123",
+    ]);
+    expect(agentChunks.map((u: any) => u.update.content.text)).toStrictEqual(["H", "i", ""]);
+    expect(agentChunks[2]?.update?._meta?.anyharness?.transcriptEvent).toBe(
+      "assistant_message_completed",
+    );
+    expect(agent.sessions["test-session"].activeAssistantMessageId).toBeNull();
+  });
 
   it("used sums all token types as post-turn context occupancy proxy", async () => {
     const { agent, updates } = createMockAgentWithCapture();
@@ -2716,6 +2948,7 @@ describe("emitRawSDKMessages", () => {
       input,
       cancelled: false,
       cwd: "/test",
+      activeAssistantMessageId: null,
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
