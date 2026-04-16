@@ -44,6 +44,8 @@ import {
 } from "@agentclientprotocol/sdk";
 import {
   CanUseTool,
+  ElicitationRequest,
+  ElicitationResult,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -79,6 +81,11 @@ export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
 const MAX_TITLE_LENGTH = 256;
+const CLAUDE_REQUEST_USER_INPUT_METHOD = "experimental/claude/requestUserInput";
+const CLAUDE_MCP_ELICITATION_METHOD = "experimental/claude/mcpElicitation";
+const TRANSIENT_STATUS_EVENT = "transient_status";
+const ASSISTANT_MESSAGE_COMPLETED_EVENT = "assistant_message_completed";
+const CLAUDE_HOOK_NATIVE_TOOL_NAME = "ClaudeHook";
 
 function sanitizeTitle(text: string): string {
   // Replace newlines and collapse whitespace
@@ -90,6 +97,114 @@ function sanitizeTitle(text: string): string {
     return sanitized;
   }
   return sanitized.slice(0, MAX_TITLE_LENGTH - 1) + "…";
+}
+
+function supportsClaudeCapability(
+  clientCapabilities: ClientCapabilities | undefined,
+  capability: "requestUserInput" | "mcpElicitation",
+): boolean {
+  const claude = clientCapabilities?._meta?.claude;
+  return (
+    typeof claude === "object" &&
+    claude !== null &&
+    !Array.isArray(claude) &&
+    (claude as Record<string, unknown>)[capability] === true
+  );
+}
+
+function permissionContextMeta(input: {
+  displayName?: string;
+  blockedPath?: string;
+  decisionReason?: string;
+  agentID?: string;
+}) {
+  const permissionContext = {
+    displayName: nonEmptyString(input.displayName),
+    blockedPath: nonEmptyString(input.blockedPath),
+    decisionReason: nonEmptyString(input.decisionReason),
+    agentId: nonEmptyString(input.agentID),
+  };
+  const compact = Object.fromEntries(
+    Object.entries(permissionContext).filter(([, value]) => value !== undefined),
+  );
+  if (Object.keys(compact).length === 0) return undefined;
+  return {
+    claudeCode: {
+      permissionContext: compact,
+    },
+  };
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function compactStatusText(parts: Array<string | undefined | null>): string {
+  return parts
+    .map((part) => part?.trim())
+    .filter((part): part is string => !!part)
+    .join("\n")
+    .trim();
+}
+
+function transientStatusUpdate(
+  sessionId: string,
+  text: string,
+  messageId: string,
+): SessionNotification {
+  return {
+    sessionId,
+    update: {
+      sessionUpdate: "agent_thought_chunk",
+      content: { type: "text", text },
+      messageId,
+      _meta: {
+        anyharness: {
+          transcriptEvent: TRANSIENT_STATUS_EVENT,
+        },
+      } satisfies ToolUpdateMeta,
+    },
+  };
+}
+
+function assistantMarkerUpdate(sessionId: string, messageId: string): SessionNotification {
+  return {
+    sessionId,
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "" },
+      messageId,
+      _meta: {
+        anyharness: {
+          transcriptEvent: ASSISTANT_MESSAGE_COMPLETED_EVENT,
+        },
+      } satisfies ToolUpdateMeta,
+    },
+  };
+}
+
+function safeDeclineMcpElicitation(): ElicitationResult {
+  return { action: "decline" };
+}
+
+function parseClaudeMcpElicitationResponse(response: Record<string, unknown>): ElicitationResult {
+  const action = response.action;
+  if (action === "accept") {
+    const content = response.content;
+    return content && typeof content === "object" && !Array.isArray(content)
+      ? {
+          action: "accept",
+          content: content as Record<string, string | number | boolean | string[]>,
+        }
+      : { action: "accept" };
+  }
+  if (action === "cancel") {
+    return { action: "cancel" };
+  }
+  if (action === "decline") {
+    return { action: "decline" };
+  }
+  return safeDeclineMcpElicitation();
 }
 
 /**
@@ -230,6 +345,11 @@ type GatewayAuthMeta = {
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
+  anyharness?: {
+    transcriptEvent?: string;
+    nativeToolName?: string;
+    toolKind?: string;
+  };
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
@@ -626,13 +746,13 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               case "status": {
                 if (message.status === "compacting") {
-                  await this.client.sessionUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "Compacting..." },
-                    },
-                  });
+                  await this.client.sessionUpdate(
+                    transientStatusUpdate(
+                      message.session_id,
+                      "Compacting...",
+                      `claude-status:${message.session_id}`,
+                    ),
+                  );
                 }
                 break;
               }
@@ -658,13 +778,13 @@ export class ClaudeAcpAgent implements Agent {
                     size: session.contextWindowSize,
                   },
                 });
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: "\n\nCompacting completed." },
-                  },
-                });
+                await this.client.sessionUpdate(
+                  transientStatusUpdate(
+                    message.session_id,
+                    "Compacting completed.",
+                    `claude-status:${message.session_id}`,
+                  ),
+                );
                 break;
               }
               case "local_command_output": {
@@ -683,20 +803,139 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 break;
               }
-              case "hook_started":
-              case "hook_progress":
-              case "hook_response":
+              case "hook_started": {
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "tool_call",
+                    toolCallId: `hook:${message.hook_id}`,
+                    title: `Hook: ${message.hook_event}`,
+                    kind: "other",
+                    status: "pending",
+                    content: [
+                      {
+                        type: "content",
+                        content: {
+                          type: "text",
+                          text: `${message.hook_name} started.`,
+                        },
+                      },
+                    ],
+                    _meta: {
+                      anyharness: {
+                        nativeToolName: CLAUDE_HOOK_NATIVE_TOOL_NAME,
+                        toolKind: "hook",
+                      },
+                      claudeCode: {
+                        toolName: CLAUDE_HOOK_NATIVE_TOOL_NAME,
+                      },
+                    } satisfies ToolUpdateMeta,
+                  },
+                });
+                break;
+              }
+              case "hook_progress": {
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: `hook:${message.hook_id}`,
+                    status: "pending",
+                    content: [
+                      {
+                        type: "content",
+                        content: {
+                          type: "text",
+                          text:
+                            compactStatusText([message.output, message.stdout, message.stderr]) ||
+                            `${message.hook_name} is running.`,
+                        },
+                      },
+                    ],
+                    _meta: {
+                      anyharness: {
+                        nativeToolName: CLAUDE_HOOK_NATIVE_TOOL_NAME,
+                        toolKind: "hook",
+                      },
+                      claudeCode: {
+                        toolName: CLAUDE_HOOK_NATIVE_TOOL_NAME,
+                      },
+                    } satisfies ToolUpdateMeta,
+                  },
+                });
+                break;
+              }
+              case "hook_response": {
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: `hook:${message.hook_id}`,
+                    status: message.outcome === "success" ? "completed" : "failed",
+                    content: [
+                      {
+                        type: "content",
+                        content: {
+                          type: "text",
+                          text:
+                            compactStatusText([message.output, message.stdout, message.stderr]) ||
+                            `${message.hook_name} ${message.outcome}.`,
+                        },
+                      },
+                    ],
+                    rawOutput: {
+                      outcome: message.outcome,
+                      exitCode: message.exit_code,
+                    },
+                    _meta: {
+                      anyharness: {
+                        nativeToolName: CLAUDE_HOOK_NATIVE_TOOL_NAME,
+                        toolKind: "hook",
+                      },
+                      claudeCode: {
+                        toolName: CLAUDE_HOOK_NATIVE_TOOL_NAME,
+                      },
+                    } satisfies ToolUpdateMeta,
+                  },
+                });
+                break;
+              }
               case "files_persisted":
-              case "task_started":
               case "task_notification":
-              case "task_progress":
               case "task_updated":
               case "elicitation_complete":
               case "plugin_install":
               case "memory_recall":
               case "notification":
+                break;
+              case "task_started":
+                if (!message.skip_transcript) {
+                  await this.client.sessionUpdate(
+                    transientStatusUpdate(
+                      message.session_id,
+                      message.description,
+                      `claude-task:${message.task_id}`,
+                    ),
+                  );
+                }
+                break;
+              case "task_progress":
+                await this.client.sessionUpdate(
+                  transientStatusUpdate(
+                    message.session_id,
+                    message.summary ?? message.description,
+                    `claude-task:${message.task_id}`,
+                  ),
+                );
+                break;
               case "api_retry":
-                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                await this.client.sessionUpdate(
+                  transientStatusUpdate(
+                    message.session_id,
+                    `Retrying Claude API request ${message.attempt}/${message.max_retries}...`,
+                    `claude-status:${message.session_id}`,
+                  ),
+                );
                 break;
               default:
                 unreachable(message, this.logger);
@@ -972,10 +1211,45 @@ export class ClaudeAcpAgent implements Agent {
             break;
           }
           case "tool_progress":
+            await this.client.sessionUpdate({
+              sessionId: message.session_id,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId: message.tool_use_id,
+                status: "pending",
+                content: [
+                  {
+                    type: "content",
+                    content: {
+                      type: "text",
+                      text: `${message.tool_name} has been running for ${Math.round(
+                        message.elapsed_time_seconds,
+                      )}s.`,
+                    },
+                  },
+                ],
+                _meta: {
+                  claudeCode: {
+                    toolName: message.tool_name,
+                  },
+                } satisfies ToolUpdateMeta,
+              },
+            });
+            break;
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
+            break;
           case "rate_limit_event":
+            if (message.rate_limit_info.status !== "allowed") {
+              await this.client.sessionUpdate(
+                transientStatusUpdate(
+                  message.session_id,
+                  "Claude rate limit status changed.",
+                  `claude-status:${message.session_id}`,
+                ),
+              );
+            }
             break;
           default:
             unreachable(message);
@@ -1215,8 +1489,45 @@ export class ClaudeAcpAgent implements Agent {
     return response;
   }
 
+  async handleMcpElicitation(
+    request: ElicitationRequest,
+    signal: AbortSignal,
+  ): Promise<ElicitationResult> {
+    if (!supportsClaudeCapability(this.clientCapabilities, "mcpElicitation")) {
+      return safeDeclineMcpElicitation();
+    }
+
+    if (signal.aborted) {
+      return { action: "cancel" };
+    }
+
+    try {
+      const response = await this.client.extMethod(CLAUDE_MCP_ELICITATION_METHOD, {
+        serverName: request.serverName,
+        message: request.message,
+        mode: request.mode ?? "form",
+        url: request.url,
+        elicitationId: request.elicitationId,
+        requestedSchema: request.requestedSchema,
+        title: request.title,
+        displayName: request.displayName,
+        description: request.description,
+      });
+      return signal.aborted ? { action: "cancel" } : parseClaudeMcpElicitationResponse(response);
+    } catch (error) {
+      this.logger.log(
+        `[claude-agent-acp] MCP elicitation extension failed; declining request: ${String(error)}`,
+      );
+      return signal.aborted ? { action: "cancel" } : safeDeclineMcpElicitation();
+    }
+  }
+
   canUseTool(sessionId: string): CanUseTool {
-    return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
+    return async (
+      toolName,
+      toolInput,
+      { signal, suggestions, toolUseID, blockedPath, decisionReason, displayName, agentID },
+    ) => {
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
@@ -1246,6 +1557,7 @@ export class ClaudeAcpAgent implements Agent {
         }
 
         const response = await this.client.requestPermission({
+          _meta: permissionContextMeta({ displayName, blockedPath, decisionReason, agentID }),
           options,
           sessionId,
           toolCall: {
@@ -1304,6 +1616,7 @@ export class ClaudeAcpAgent implements Agent {
       }
 
       const response = await this.client.requestPermission({
+        _meta: permissionContextMeta({ displayName, blockedPath, decisionReason, agentID }),
         options: [
           {
             kind: "allow_always",
@@ -1528,8 +1841,15 @@ export class ClaudeAcpAgent implements Agent {
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
       : undefined;
 
-    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
+    // The SDK exposes MCP elicitation via onElicitation, but AskUserQuestion
+    // currently uses request_user_dialog internally without a public callback.
+    // Keep it disallowed until that SDK hook exists; otherwise the SDK throws
+    // an unsupported-control-request error mid-turn.
     const disallowedTools = ["AskUserQuestion"];
+    const supportsClaudeMcpElicitation = supportsClaudeCapability(
+      this.clientCapabilities,
+      "mcpElicitation",
+    );
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
@@ -1562,6 +1882,9 @@ export class ClaudeAcpAgent implements Agent {
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
       permissionMode,
       canUseTool: this.canUseTool(sessionId),
+      ...(supportsClaudeMcpElicitation
+        ? { onElicitation: (request, { signal }) => this.handleMcpElicitation(request, signal) }
+        : {}),
       // note: although not documented by the types, passing an absolute path
       // here works to find zed's managed node version.
       executable: isStaticBinary() ? undefined : (process.execPath as any),
@@ -2086,6 +2409,7 @@ export function toAcpNotifications(
     clientCapabilities?: ClientCapabilities;
     parentToolUseId?: string | null;
     cwd?: string;
+    messageId?: string;
   },
 ): SessionNotification[] {
   const registerHooks = options?.registerHooks !== false;
@@ -2108,6 +2432,9 @@ export function toAcpNotifications(
         },
       };
     }
+    if (options?.messageId) {
+      (update as { messageId?: string }).messageId = options.messageId;
+    }
 
     return [{ sessionId, update }];
   }
@@ -2125,6 +2452,7 @@ export function toAcpNotifications(
             type: "text",
             text: chunk.text,
           },
+          ...(options?.messageId ? { messageId: options.messageId } : {}),
         };
         break;
       case "image":
@@ -2146,6 +2474,7 @@ export function toAcpNotifications(
             type: "text",
             text: chunk.thinking,
           },
+          ...(options?.messageId ? { messageId: options.messageId } : {}),
         };
         break;
       case "tool_use":
@@ -2345,10 +2674,13 @@ export function streamEventToAcpNotifications(
   },
 ): SessionNotification[] {
   const event = message.event;
+  const assistantMessageId = `claude:${message.uuid}`;
+  const contentBlockIndex = "index" in event && typeof event.index === "number" ? event.index : 0;
   switch (event.type) {
-    case "content_block_start":
+    case "content_block_start": {
+      const contentBlock = event.content_block;
       return toAcpNotifications(
-        [event.content_block],
+        [contentBlock],
         "assistant",
         sessionId,
         toolUseCache,
@@ -2358,26 +2690,30 @@ export function streamEventToAcpNotifications(
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
+          messageId:
+            contentBlock.type === "thinking"
+              ? `${assistantMessageId}:thinking:${contentBlockIndex}`
+              : assistantMessageId,
         },
       );
-    case "content_block_delta":
-      return toAcpNotifications(
-        [event.delta],
-        "assistant",
-        sessionId,
-        toolUseCache,
-        client,
-        logger,
-        {
-          clientCapabilities: options?.clientCapabilities,
-          parentToolUseId: message.parent_tool_use_id,
-          cwd: options?.cwd,
-        },
-      );
+    }
+    case "content_block_delta": {
+      const delta = event.delta;
+      return toAcpNotifications([delta], "assistant", sessionId, toolUseCache, client, logger, {
+        clientCapabilities: options?.clientCapabilities,
+        parentToolUseId: message.parent_tool_use_id,
+        cwd: options?.cwd,
+        messageId:
+          delta.type === "thinking_delta"
+            ? `${assistantMessageId}:thinking:${contentBlockIndex}`
+            : assistantMessageId,
+      });
+    }
+    case "message_stop":
+      return [assistantMarkerUpdate(sessionId, assistantMessageId)];
     // No content
     case "message_start":
     case "message_delta":
-    case "message_stop":
     case "content_block_stop":
       return [];
 

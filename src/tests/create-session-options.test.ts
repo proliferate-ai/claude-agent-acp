@@ -38,10 +38,13 @@ describe("createSession options merging", () => {
   let agent: ClaudeAcpAgentType;
   let ClaudeAcpAgent: typeof ClaudeAcpAgentType;
 
-  function createMockClient(): AgentSideConnection {
+  function createMockClient(
+    extMethod: AgentSideConnection["extMethod"] = async () => ({ action: "decline" }),
+  ): AgentSideConnection {
     return {
       sessionUpdate: async (_notification: SessionNotification) => {},
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      extMethod,
       readTextFile: async () => ({ content: "" }),
       writeTextFile: async () => ({}),
     } as unknown as AgentSideConnection;
@@ -100,6 +103,35 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+  });
+
+  it("wires Claude MCP elicitation only when the client capability is present", async () => {
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: {
+          claude: {
+            mcpElicitation: true,
+          },
+        },
+      },
+    });
+
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.onElicitation).toEqual(expect.any(Function));
+  });
+
+  it("leaves Claude MCP elicitation unwired when the capability is missing", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.onElicitation).toBeUndefined();
   });
 
   it("sets tools to empty array when disableBuiltInTools is true", async () => {
