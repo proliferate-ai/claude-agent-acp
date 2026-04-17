@@ -34,6 +34,7 @@ describe("ClaudeAcpAgent settings", () => {
     models?: any[];
     initialSettings?: Record<string, unknown>;
     settingsResponseShape?: "flat" | "effective";
+    fastModeState?: "off" | "cooldown" | "on";
   }) {
     let capturedOptions: any;
     let currentSettings = { ...(params?.initialSettings ?? {}) };
@@ -61,6 +62,9 @@ describe("ClaudeAcpAgent settings", () => {
               description: "Default",
             },
           ],
+          ...(params?.fastModeState !== undefined
+            ? { fast_mode_state: params.fastModeState }
+            : {}),
         }),
         setModel: setModelSpy,
         applyFlagSettings: applyFlagSettingsSpy,
@@ -297,6 +301,86 @@ describe("ClaudeAcpAgent settings", () => {
       alwaysThinkingEnabled: true,
     });
     expect(getCurrentSettings().alwaysThinkingEnabled).toBe(true);
+  });
+
+  it("includes fast mode when the SDK advertises session-level fast mode state", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    mockQuery({
+      models: [
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Default",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          supportsAdaptiveThinking: true,
+          supportsFastMode: false,
+        },
+      ],
+      initialSettings: {
+        alwaysThinkingEnabled: true,
+        effortLevel: "medium",
+      },
+      fastModeState: "off",
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(response.configOptions.map((option: any) => option.id)).toEqual([
+      "mode",
+      "model",
+      "effort",
+      "fast_mode",
+    ]);
+    expect(
+      response.configOptions.find((option: any) => option.id === "fast_mode")?.currentValue,
+    ).toBe("off");
+  });
+
+  it("uses enabled session-level fast mode state as the current fast mode value", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    mockQuery({
+      models: [
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Default",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          supportsAdaptiveThinking: true,
+          supportsFastMode: false,
+        },
+      ],
+      initialSettings: {
+        alwaysThinkingEnabled: true,
+        effortLevel: "medium",
+      },
+      fastModeState: "on",
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(
+      response.configOptions.find((option: any) => option.id === "fast_mode")?.currentValue,
+    ).toBe("on");
   });
 
   it("reads effort and fast mode from wrapped effective settings responses", async () => {

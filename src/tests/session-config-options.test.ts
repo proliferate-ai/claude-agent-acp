@@ -190,6 +190,7 @@ describe("session config options", () => {
   function populateSession(params?: {
     currentModelId?: string;
     currentModeId?: string;
+    fastModeState?: "off" | "cooldown" | "on" | null;
     modelCapabilitiesById?: TestModelCapabilitiesById;
     configOptions?: ReturnType<typeof createConfigOptions>;
     settings?: Record<string, unknown>;
@@ -217,6 +218,7 @@ describe("session config options", () => {
       cancelled: false,
       cwd: "/test",
       activeAssistantMessageId: null,
+      fastModeState: params?.fastModeState ?? null,
       sessionFingerprint: "{}",
       settingsManager: {
         dispose: () => {},
@@ -492,6 +494,31 @@ describe("session config options", () => {
       expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
         fastMode: true,
       });
+      expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("on");
+    });
+
+    it("updates adapter fast mode state after setting fast mode", async () => {
+      populateSession({
+        modelCapabilitiesById: NO_REASONING_MODEL_CAPABILITIES,
+        configOptions: createConfigOptions({
+          includeReasoning: true,
+          fastModeCurrentValue: "off",
+        }),
+        fastModeState: "off",
+      });
+      const session = (agent as any).sessions[SESSION_ID];
+      delete session.query.getSettings;
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "fast_mode",
+        value: "on",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        fastMode: true,
+      });
+      expect(session.fastModeState).toBe("on");
       expect(response.configOptions.find((o) => o.id === "fast_mode")?.currentValue).toBe("on");
     });
 

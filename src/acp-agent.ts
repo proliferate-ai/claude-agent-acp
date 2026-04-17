@@ -46,6 +46,7 @@ import {
   CanUseTool,
   ElicitationRequest,
   ElicitationResult,
+  FastModeState,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -280,12 +281,17 @@ function unwrapEffectiveSettings(result: SessionSettingsResult | null | undefine
   return (result ?? {}) as Settings;
 }
 
+function normalizeFastModeState(value: unknown): FastModeState | null {
+  return value === "off" || value === "cooldown" || value === "on" ? value : null;
+}
+
 type Session = {
   query: MutableQuery;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   cwd: string;
   activeAssistantMessageId: string | null;
+  fastModeState: FastModeState | null;
   /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
    *  detect when loadSession/resumeSession is called with changed values. */
   sessionFingerprint: string;
@@ -1020,6 +1026,12 @@ export class ClaudeAcpAgent implements Agent {
               });
             }
 
+            await this.updateSessionFastModeState(
+              params.sessionId,
+              session,
+              message.fast_mode_state,
+            );
+
             if (session.cancelled) {
               stopReason = "cancelled";
               break;
@@ -1488,6 +1500,7 @@ export class ClaudeAcpAgent implements Agent {
         await session.query.applyFlagSettings({
           fastMode: resolvedValue === "on",
         });
+        session.fastModeState = resolvedValue === "on" ? "on" : "off";
         break;
       default:
         throw new Error(`Unknown config option: ${params.configId}`);
@@ -1787,6 +1800,8 @@ export class ClaudeAcpAgent implements Agent {
         session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
+    } else if (configId === "fast_mode") {
+      session.fastModeState = value === "on" ? "on" : "off";
     }
   }
 
@@ -1797,9 +1812,32 @@ export class ClaudeAcpAgent implements Agent {
       session.models,
       session.modelCapabilitiesById,
       settings,
+      session.fastModeState,
     );
     session.configOptions = configOptions;
     return configOptions;
+  }
+
+  private async updateSessionFastModeState(
+    sessionId: string,
+    session: Session,
+    value: unknown,
+  ): Promise<void> {
+    const fastModeState = normalizeFastModeState(value);
+    if (fastModeState === null || session.fastModeState === fastModeState) {
+      return;
+    }
+
+    session.fastModeState = fastModeState;
+    const configOptions = await this.rebuildSessionConfigOptions(session);
+
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions,
+      },
+    });
   }
 
   private async getNormalizedSessionSettings(session: Session): Promise<Settings> {
@@ -2144,6 +2182,7 @@ export class ClaudeAcpAgent implements Agent {
       cancelled: false,
       cwd: params.cwd,
       activeAssistantMessageId: null,
+      fastModeState: normalizeFastModeState(initializationResult.fast_mode_state),
       sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,
       accumulatedUsage: {
@@ -2251,6 +2290,7 @@ function buildConfigOptions(
   models: SessionModelState,
   modelCapabilitiesById: ModelCapabilitiesById,
   settings: Settings,
+  fastModeState: FastModeState | null,
 ): SessionConfigOption[] {
   const configOptions: SessionConfigOption[] = [
     {
@@ -2303,14 +2343,22 @@ function buildConfigOptions(
     });
   }
 
-  if (currentCapabilities?.supportsFastMode) {
+  if (currentCapabilities?.supportsFastMode || fastModeState !== null) {
+    const currentFastModeValue =
+      fastModeState !== null
+        ? fastModeState === "on"
+          ? "on"
+          : "off"
+        : settings.fastMode === true
+          ? "on"
+          : "off";
     configOptions.push({
       id: "fast_mode",
       name: "Fast Mode",
       description: "Favor faster responses",
       category: "_fast_mode",
       type: "select",
-      currentValue: settings.fastMode === true ? "on" : "off",
+      currentValue: currentFastModeValue,
       options: [
         {
           value: "off",

@@ -1471,6 +1471,7 @@ describe("stop reason propagation", () => {
       cancelled: false,
       cwd: "/test",
       activeAssistantMessageId: null,
+      fastModeState: null,
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
         currentModeId: "default",
@@ -1616,6 +1617,7 @@ describe("stop reason propagation", () => {
       sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
       cancelled: false,
       activeAssistantMessageId: null,
+      fastModeState: null,
       modes: {
         currentModeId: "default",
         availableModes: [],
@@ -1693,6 +1695,7 @@ describe("session/close", () => {
       cancelled: false,
       cwd: "/test",
       activeAssistantMessageId: null,
+      fastModeState: null,
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
         currentModeId: "default",
@@ -1793,6 +1796,7 @@ describe("getOrCreateSession param change detection", () => {
       cancelled: false,
       cwd,
       activeAssistantMessageId: null,
+      fastModeState: null,
       sessionFingerprint: JSON.stringify({
         cwd,
         mcpServers: [...mcpServers].sort((a: any, b: any) => a.name.localeCompare(b.name)),
@@ -1948,6 +1952,7 @@ describe("usage_update computation", () => {
         maxOutputTokens: number;
       }
     >;
+    fastModeState?: "off" | "cooldown" | "on";
   }) {
     return {
       type: "result" as const,
@@ -1968,6 +1973,9 @@ describe("usage_update computation", () => {
       },
       modelUsage: overrides.modelUsage,
       permission_denials: [],
+      ...(overrides.fastModeState !== undefined
+        ? { fast_mode_state: overrides.fastModeState }
+        : {}),
       uuid: randomUUID(),
       session_id: "test-session",
     };
@@ -2025,6 +2033,7 @@ describe("usage_update computation", () => {
       cancelled: false,
       cwd: "/test",
       activeAssistantMessageId: null,
+      fastModeState: null,
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
         currentModeId: "default",
@@ -2135,6 +2144,28 @@ describe("usage_update computation", () => {
       "assistant_message_completed",
     );
     expect(agent.sessions["test-session"].activeAssistantMessageId).toBeNull();
+  });
+
+  it("updates fast mode config from result fast_mode_state", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createResultMessageWithModel({
+        modelUsage: {},
+        fastModeState: "cooldown",
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    expect(agent.sessions["test-session"].fastModeState).toBe("cooldown");
+    const configUpdate = updates.find(
+      (u: any) => u.update?.sessionUpdate === "config_option_update",
+    );
+    const fastModeOption = configUpdate?.update?.configOptions.find(
+      (option: any) => option.id === "fast_mode",
+    );
+    expect(fastModeOption?.currentValue).toBe("off");
   });
 
   it("used sums all token types as post-turn context occupancy proxy", async () => {
@@ -2954,6 +2985,7 @@ describe("emitRawSDKMessages", () => {
       cancelled: false,
       cwd: "/test",
       activeAssistantMessageId: null,
+      fastModeState: null,
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
