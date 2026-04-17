@@ -30,14 +30,31 @@ describe("ClaudeAcpAgent settings", () => {
     } as unknown as AgentSideConnection;
   }
 
-  function mockQuery() {
+  function mockQuery(params?: {
+    models?: any[];
+    initialSettings?: Record<string, unknown>;
+    settingsResponseShape?: "flat" | "effective";
+  }) {
     let capturedOptions: any;
+    let currentSettings = { ...(params?.initialSettings ?? {}) };
+    const settingsResponseShape = params?.settingsResponseShape ?? "flat";
     const setModelSpy = vi.fn();
+    const applyFlagSettingsSpy = vi.fn(async (settingsPatch: Record<string, unknown>) => {
+      currentSettings = {
+        ...currentSettings,
+        ...settingsPatch,
+      };
+    });
+    const getSettingsSpy = vi.fn(async () =>
+      settingsResponseShape === "effective"
+        ? { effective: { ...currentSettings } }
+        : { ...currentSettings },
+    );
     querySpy.mockImplementation(({ options }: any) => {
       capturedOptions = options;
       return {
         initializationResult: async () => ({
-          models: [
+          models: params?.models ?? [
             {
               value: "claude-sonnet-4-5",
               displayName: "Claude Sonnet 4.5",
@@ -46,10 +63,18 @@ describe("ClaudeAcpAgent settings", () => {
           ],
         }),
         setModel: setModelSpy,
+        applyFlagSettings: applyFlagSettingsSpy,
+        getSettings: getSettingsSpy,
         supportedCommands: async () => [],
       } as any;
     });
-    return { getCapturedOptions: () => capturedOptions, setModelSpy };
+    return {
+      getCapturedOptions: () => capturedOptions,
+      setModelSpy,
+      applyFlagSettingsSpy,
+      getSettingsSpy,
+      getCurrentSettings: () => ({ ...currentSettings }),
+    };
   }
 
   beforeEach(async () => {
@@ -216,5 +241,105 @@ describe("ClaudeAcpAgent settings", () => {
 
     expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
     expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
+  });
+
+  it("includes effort and fast mode config options and normalizes thinking on", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { applyFlagSettingsSpy, getCurrentSettings } = mockQuery({
+      models: [
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Default",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+          supportsAdaptiveThinking: true,
+          supportsFastMode: true,
+        },
+      ],
+      initialSettings: {
+        alwaysThinkingEnabled: false,
+        effortLevel: "medium",
+        fastMode: true,
+      },
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(response.configOptions.map((option: any) => option.id)).toEqual([
+      "mode",
+      "model",
+      "effort",
+      "fast_mode",
+    ]);
+    expect(response.configOptions.find((option: any) => option.id === "effort")?.options).toEqual([
+      { value: "low", name: "Low" },
+      { value: "medium", name: "Medium" },
+      { value: "high", name: "High" },
+      { value: "xhigh", name: "X High" },
+    ]);
+    expect(response.configOptions.find((option: any) => option.id === "effort")?.currentValue).toBe(
+      "medium",
+    );
+    expect(
+      response.configOptions.find((option: any) => option.id === "fast_mode")?.currentValue,
+    ).toBe("on");
+    expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+      alwaysThinkingEnabled: true,
+    });
+    expect(getCurrentSettings().alwaysThinkingEnabled).toBe(true);
+  });
+
+  it("reads effort and fast mode from wrapped effective settings responses", async () => {
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { applyFlagSettingsSpy } = mockQuery({
+      models: [
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet 4.5",
+          description: "Default",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          supportsAdaptiveThinking: true,
+          supportsFastMode: true,
+        },
+      ],
+      initialSettings: {
+        alwaysThinkingEnabled: false,
+        effortLevel: "medium",
+        fastMode: true,
+      },
+      settingsResponseShape: "effective",
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(response.configOptions.find((option: any) => option.id === "effort")?.currentValue).toBe(
+      "medium",
+    );
+    expect(
+      response.configOptions.find((option: any) => option.id === "fast_mode")?.currentValue,
+    ).toBe("on");
+    expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+      alwaysThinkingEnabled: true,
+    });
   });
 });

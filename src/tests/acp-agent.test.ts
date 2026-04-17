@@ -1480,6 +1480,7 @@ describe("stop reason propagation", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelCapabilitiesById: {},
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1623,6 +1624,7 @@ describe("stop reason propagation", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelCapabilitiesById: {},
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1700,6 +1702,7 @@ describe("session/close", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelCapabilitiesById: {},
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1796,6 +1799,7 @@ describe("getOrCreateSession param change detection", () => {
       }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
+      modelCapabilitiesById: {},
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -2030,6 +2034,7 @@ describe("usage_update computation", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelCapabilitiesById: {},
       settingsManager: {} as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -2952,6 +2957,7 @@ describe("emitRawSDKMessages", () => {
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
+      modelCapabilitiesById: {},
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,

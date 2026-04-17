@@ -56,6 +56,7 @@ import {
   Query,
   query,
   SDKPartialAssistantMessage,
+  Settings,
   SDKUserMessage,
   SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -238,8 +239,49 @@ const ZERO_USAGE = Object.freeze({
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
 
+type SupportedEffortLevel = NonNullable<ModelInfo["supportedEffortLevels"]>[number];
+// The SDK model metadata can advertise "max", but live Settings.effortLevel
+// currently supports up to "xhigh". Keep ACP live config settable values to
+// the documented mid-session applyFlagSettings surface.
+type LiveEffortLevel = Exclude<SupportedEffortLevel, "max">;
+
+type ModelCapabilities = {
+  supportsEffort: boolean;
+  supportedEffortLevels: SupportedEffortLevel[];
+  supportsAdaptiveThinking: boolean;
+  supportsFastMode: boolean;
+};
+
+type ModelCapabilitiesById = Record<string, ModelCapabilities>;
+
+type AvailableModelsResult = {
+  state: SessionModelState;
+  capabilitiesById: ModelCapabilitiesById;
+};
+
+type SessionSettingsEnvelope = {
+  effective?: Settings;
+  sources?: unknown;
+  applied?: unknown;
+};
+
+type SessionSettingsResult = Settings | SessionSettingsEnvelope;
+
+type MutableQuery = Query & {
+  applyFlagSettings?: (settings: Settings) => Promise<void>;
+  getSettings?: () => Promise<SessionSettingsResult>;
+};
+
+function unwrapEffectiveSettings(result: SessionSettingsResult | null | undefined): Settings {
+  if (result && typeof result === "object" && "effective" in result) {
+    return (result.effective ?? {}) as Settings;
+  }
+
+  return (result ?? {}) as Settings;
+}
+
 type Session = {
-  query: Query;
+  query: MutableQuery;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   cwd: string;
@@ -251,6 +293,7 @@ type Session = {
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
   models: SessionModelState;
+  modelCapabilitiesById: ModelCapabilitiesById;
   configOptions: SessionConfigOption[];
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
@@ -1414,28 +1457,43 @@ export class ClaudeAcpAgent implements Agent {
     // model ID rather than the caller-supplied alias.
     const resolvedValue = validValue.value;
 
-    if (params.configId === "mode") {
-      await this.applySessionMode(params.sessionId, resolvedValue);
-      await this.client.sessionUpdate({
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "current_mode_update",
-          currentModeId: resolvedValue,
-        },
-      });
-    } else if (params.configId === "model") {
-      await this.sessions[params.sessionId].query.setModel(resolvedValue);
+    switch (params.configId) {
+      case "mode":
+        await this.applySessionMode(params.sessionId, resolvedValue);
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "current_mode_update",
+            currentModeId: resolvedValue,
+          },
+        });
+        this.syncSessionConfigState(session, params.configId, resolvedValue);
+        break;
+      case "model":
+        await session.query.setModel(resolvedValue);
+        this.syncSessionConfigState(session, params.configId, resolvedValue);
+        break;
+      case "effort":
+        if (typeof session.query.applyFlagSettings !== "function") {
+          throw new Error(`Unknown config option: ${params.configId}`);
+        }
+        await session.query.applyFlagSettings({
+          effortLevel: resolvedValue as LiveEffortLevel,
+        });
+        break;
+      case "fast_mode":
+        if (typeof session.query.applyFlagSettings !== "function") {
+          throw new Error(`Unknown config option: ${params.configId}`);
+        }
+        await session.query.applyFlagSettings({
+          fastMode: resolvedValue === "on",
+        });
+        break;
+      default:
+        throw new Error(`Unknown config option: ${params.configId}`);
     }
 
-    this.syncSessionConfigState(session, params.configId, params.value);
-
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === params.configId && typeof o.currentValue === "string"
-        ? { ...o, currentValue: resolvedValue }
-        : o,
-    );
-
-    return { configOptions: session.configOptions };
+    return { configOptions: await this.rebuildSessionConfigOptions(session) };
   }
 
   private async applySessionMode(sessionId: string, modeId: string): Promise<void> {
@@ -1706,15 +1764,13 @@ export class ClaudeAcpAgent implements Agent {
 
     this.syncSessionConfigState(session, configId, value);
 
-    session.configOptions = session.configOptions.map((o) =>
-      o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
-    );
+    const configOptions = await this.rebuildSessionConfigOptions(session);
 
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "config_option_update",
-        configOptions: session.configOptions,
+        configOptions,
       },
     });
   }
@@ -1732,6 +1788,59 @@ export class ClaudeAcpAgent implements Agent {
       }
       session.models = { ...session.models, currentModelId: value };
     }
+  }
+
+  private async rebuildSessionConfigOptions(session: Session): Promise<SessionConfigOption[]> {
+    const settings = await this.getNormalizedSessionSettings(session);
+    const configOptions = buildConfigOptions(
+      session.modes,
+      session.models,
+      session.modelCapabilitiesById,
+      settings,
+    );
+    session.configOptions = configOptions;
+    return configOptions;
+  }
+
+  private async getNormalizedSessionSettings(session: Session): Promise<Settings> {
+    if (typeof session.query.getSettings !== "function") {
+      return {};
+    }
+
+    let settings = unwrapEffectiveSettings(await session.query.getSettings());
+    const currentCapabilities = session.modelCapabilitiesById[session.models.currentModelId];
+    const reasoningCapable = supportsReasoningControls(currentCapabilities);
+    const supportedEffortLevels = getLiveEffortLevels(currentCapabilities);
+
+    if (!reasoningCapable || typeof session.query.applyFlagSettings !== "function") {
+      return settings;
+    }
+
+    const nextSettings: Settings = {};
+
+    if (settings.alwaysThinkingEnabled !== true) {
+      nextSettings.alwaysThinkingEnabled = true;
+    }
+
+    if (
+      supportedEffortLevels.length > 0 &&
+      !(
+        settings.effortLevel !== undefined &&
+        supportedEffortLevels.includes(settings.effortLevel as LiveEffortLevel)
+      )
+    ) {
+      nextSettings.effortLevel = supportedEffortLevels.includes("high")
+        ? "high"
+        : supportedEffortLevels[0];
+    }
+
+    if (Object.keys(nextSettings).length === 0) {
+      return settings;
+    }
+
+    await session.query.applyFlagSettings(nextSettings);
+    settings = unwrapEffectiveSettings(await session.query.getSettings());
+    return settings;
   }
 
   private async getOrCreateSession(params: {
@@ -1982,7 +2091,11 @@ export class ClaudeAcpAgent implements Agent {
       );
     }
 
-    const models = await getAvailableModels(q, initializationResult.models, settingsManager);
+    const { state: models, capabilitiesById } = await getAvailableModels(
+      q,
+      initializationResult.models,
+      settingsManager,
+    );
 
     const availableModes = [
       {
@@ -2025,9 +2138,7 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
-    const configOptions = buildConfigOptions(modes, models);
-
-    this.sessions[sessionId] = {
+    const session: Session = {
       query: q,
       input: input,
       cancelled: false,
@@ -2043,7 +2154,8 @@ export class ClaudeAcpAgent implements Agent {
       },
       modes,
       models,
-      configOptions,
+      modelCapabilitiesById: capabilitiesById,
+      configOptions: [],
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
@@ -2052,6 +2164,8 @@ export class ClaudeAcpAgent implements Agent {
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
     };
+    const configOptions = await this.rebuildSessionConfigOptions(session);
+    this.sessions[sessionId] = session;
 
     return {
       sessionId,
@@ -2135,8 +2249,10 @@ function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
+  modelCapabilitiesById: ModelCapabilitiesById,
+  settings: Settings,
 ): SessionConfigOption[] {
-  return [
+  const configOptions: SessionConfigOption[] = [
     {
       id: "mode",
       name: "Mode",
@@ -2164,6 +2280,51 @@ function buildConfigOptions(
       })),
     },
   ];
+
+  const currentCapabilities = modelCapabilitiesById[models.currentModelId];
+  const effortLevels = getLiveEffortLevels(currentCapabilities);
+  if (effortLevels.length > 0) {
+    const currentEffortLevel = effortLevels.includes(settings.effortLevel as LiveEffortLevel)
+      ? (settings.effortLevel as LiveEffortLevel)
+      : effortLevels.includes("high")
+        ? "high"
+        : effortLevels[0];
+    configOptions.push({
+      id: "effort",
+      name: "Effort",
+      description: "Reasoning depth",
+      category: "thought_level",
+      type: "select",
+      currentValue: currentEffortLevel,
+      options: effortLevels.map((value) => ({
+        value,
+        name: value === "xhigh" ? "X High" : value[0].toUpperCase() + value.slice(1),
+      })),
+    });
+  }
+
+  if (currentCapabilities?.supportsFastMode) {
+    configOptions.push({
+      id: "fast_mode",
+      name: "Fast Mode",
+      description: "Favor faster responses",
+      category: "_fast_mode",
+      type: "select",
+      currentValue: settings.fastMode === true ? "on" : "off",
+      options: [
+        {
+          value: "off",
+          name: "Off",
+        },
+        {
+          value: "on",
+          name: "On",
+        },
+      ],
+    });
+  }
+
+  return configOptions;
 }
 
 // Claude Code CLI persists display strings like "opus[1m]" in settings,
@@ -2243,22 +2404,24 @@ async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
   settingsManager: SettingsManager,
-): Promise<SessionModelState> {
+): Promise<AvailableModelsResult> {
   const settings = settingsManager.getSettings();
+  const visibleModels = models.filter((model) => model.value !== "default");
+  const selectableModels = visibleModels.length > 0 ? visibleModels : models;
 
-  let currentModel = models[0];
+  let currentModel = selectableModels[0];
 
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
   // 2. settings.model (user configuration)
   // 3. models[0] (default first model)
   if (process.env.ANTHROPIC_MODEL) {
-    const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
+    const match = resolveModelPreference(selectableModels, process.env.ANTHROPIC_MODEL);
     if (match) {
       currentModel = match;
     }
   } else if (settings.model) {
-    const match = resolveModelPreference(models, settings.model);
+    const match = resolveModelPreference(selectableModels, settings.model);
     if (match) {
       currentModel = match;
     }
@@ -2267,13 +2430,47 @@ async function getAvailableModels(
   await query.setModel(currentModel.value);
 
   return {
-    availableModels: models.map((model) => ({
-      modelId: model.value,
-      name: model.displayName,
-      description: model.description,
-    })),
-    currentModelId: currentModel.value,
+    state: {
+      availableModels: selectableModels.map((model) => ({
+        modelId: model.value,
+        name: model.displayName,
+        description: model.description,
+      })),
+      currentModelId: currentModel.value,
+    },
+    capabilitiesById: Object.fromEntries(
+      selectableModels.map((model) => [
+        model.value,
+        {
+          supportsEffort: model.supportsEffort ?? false,
+          supportedEffortLevels: [...(model.supportedEffortLevels ?? [])],
+          supportsAdaptiveThinking: model.supportsAdaptiveThinking ?? false,
+          supportsFastMode: model.supportsFastMode ?? false,
+        } satisfies ModelCapabilities,
+      ]),
+    ),
   };
+}
+
+function supportsReasoningControls(capabilities?: ModelCapabilities): boolean {
+  return !!(
+    capabilities &&
+    (capabilities.supportsAdaptiveThinking ||
+      capabilities.supportsEffort ||
+      capabilities.supportedEffortLevels.length > 0)
+  );
+}
+
+function getLiveEffortLevels(capabilities?: ModelCapabilities): LiveEffortLevel[] {
+  if (!capabilities) {
+    return [];
+  }
+
+  return capabilities.supportedEffortLevels.filter(isLiveEffortLevel);
+}
+
+function isLiveEffortLevel(level: SupportedEffortLevel): level is LiveEffortLevel {
+  return level === "low" || level === "medium" || level === "high" || level === "xhigh";
 }
 
 function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
