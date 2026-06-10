@@ -229,6 +229,10 @@ type Session = {
    *  NOT READ YET — recorded now so the mapping exists if/when we wire up
    *  fork/rewind. */
   messageIdToUuid: Map<string, string>;
+  /** Whether fast mode is currently enabled for this session. Tracks the
+   *  client-requested state so config option rebuilds (e.g. on model switch)
+   *  can preserve it. Defaults to false (fast mode off). */
+  fastModeEnabled: boolean;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -2289,7 +2293,8 @@ export class ClaudeAcpAgent implements Agent {
         session.modes = { ...session.modes, availableModes: newAvailableModes };
       }
 
-      // Rebuild config options since effort levels depend on the selected model
+      // Rebuild config options since effort levels and fast_mode availability
+      // depend on the selected model
       const effortOpt = session.configOptions.find((o) => o.id === "effort");
       const currentEffort =
         typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
@@ -2298,6 +2303,7 @@ export class ClaudeAcpAgent implements Agent {
         session.models,
         session.modelInfos,
         currentEffort,
+        session.fastModeEnabled,
       );
 
       // Sync effort with the SDK if it changed after the model switch
@@ -2333,6 +2339,10 @@ export class ClaudeAcpAgent implements Agent {
         await session.query.applyFlagSettings({
           effortLevel: toSdkEffortLevel(value),
         });
+      } else if (configId === "fast_mode") {
+        const enabled = value === "on";
+        session.fastModeEnabled = enabled;
+        await session.query.applyFlagSettings({ fastMode: enabled });
       }
     }
   }
@@ -2747,11 +2757,16 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
+    // Fast mode starts disabled for every new session. The client can enable it
+    // via setSessionConfigOption after session creation.
+    const initialFastModeEnabled = false;
+
     const configOptions = buildConfigOptions(
       modes,
       models,
       allowedModels,
       settingsManager.getSettings().effortLevel,
+      initialFastModeEnabled,
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
@@ -2792,6 +2807,7 @@ export class ClaudeAcpAgent implements Agent {
       taskState,
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      fastModeEnabled: initialFastModeEnabled,
     };
 
     return {
@@ -2971,6 +2987,7 @@ function buildConfigOptions(
   models: SessionModelState,
   modelInfos: ModelInfo[],
   currentEffortLevel?: string,
+  currentFastModeEnabled?: boolean,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -3031,6 +3048,22 @@ function buildConfigOptions(
       type: "select",
       currentValue: validEffort,
       options: effortOptions,
+    });
+  }
+
+  // Add fast_mode option when the current model supports it
+  if (currentModelInfo?.supportsFastMode) {
+    options.push({
+      id: "fast_mode",
+      name: "Fast Mode",
+      description: "Favor faster responses",
+      category: "_fast_mode",
+      type: "select",
+      currentValue: currentFastModeEnabled === true ? "on" : "off",
+      options: [
+        { value: "off", name: "Off" },
+        { value: "on", name: "On" },
+      ],
     });
   }
 
