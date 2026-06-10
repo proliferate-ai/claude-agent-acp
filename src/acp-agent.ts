@@ -232,7 +232,7 @@ type Session = {
   /** Whether fast mode is currently enabled for this session. Tracks the
    *  client-requested state so config option rebuilds (e.g. on model switch)
    *  can preserve it. Defaults to false (fast mode off). */
-  fastModeEnabled: boolean;
+  fastModeEnabled?: boolean;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
