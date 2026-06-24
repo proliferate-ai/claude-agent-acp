@@ -17,6 +17,7 @@ import {
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
+  PermissionOption,
   PromptRequest,
   PromptResponse,
   ReadTextFileRequest,
@@ -281,6 +282,12 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+const PLAN_REJECTION_OPTION_META = {
+  "anyharness.dev/permissionOptionPresentation": {
+    kind: "feedback_text_input",
+    placeholder: "Tell Claude what to change",
+  },
+};
 
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   default: "default",
@@ -1121,14 +1128,19 @@ export class ClaudeAcpAgent implements Agent {
       }
 
       if (toolName === "ExitPlanMode") {
-        const options = [
+        const options: PermissionOption[] = [
           {
             kind: "allow_always",
             name: "Yes, and auto-accept edits",
             optionId: "acceptEdits",
           },
           { kind: "allow_once", name: "Yes, and manually approve edits", optionId: "default" },
-          { kind: "reject_once", name: "No, keep planning", optionId: "plan" },
+          {
+            kind: "reject_once",
+            name: "No, keep planning",
+            optionId: "plan",
+            _meta: PLAN_REJECTION_OPTION_META,
+          },
         ];
         if (ALLOW_BYPASS) {
           options.unshift({

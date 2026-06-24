@@ -1201,6 +1201,63 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
 });
 
 describe("permission requests", () => {
+  it("marks only the ExitPlanMode keep-planning option as a feedback text input", async () => {
+    let capturedRequest: RequestPermissionRequest | undefined;
+    const sessionId = "session-plan-feedback";
+    const agent = new ClaudeAcpAgent(
+      {
+        requestPermission: async (params: RequestPermissionRequest) => {
+          capturedRequest = params;
+          return { outcome: { outcome: "selected", optionId: "plan" } };
+        },
+        sessionUpdate: async () => {},
+      } as unknown as AgentSideConnection,
+      { log: () => {}, error: () => {} },
+    );
+    agent.sessions[sessionId] = {
+      cwd: "/tmp/project",
+      modes: { currentModeId: "plan", availableModes: [] },
+    } as any;
+
+    const result = await agent.canUseTool(sessionId)(
+      "ExitPlanMode",
+      { plan: "Implementation plan" },
+      {
+        signal: new AbortController().signal,
+        toolUseID: "toolu-plan-feedback",
+      },
+    );
+
+    expect(result).toEqual({
+      behavior: "deny",
+      message: "User rejected request to exit plan mode.",
+    });
+    expect(capturedRequest).toBeDefined();
+
+    const options = capturedRequest!.options;
+    const optionIds = options.map((option) => option.optionId);
+    if (optionIds[0] === "bypassPermissions") {
+      expect(optionIds).toEqual(["bypassPermissions", "acceptEdits", "default", "plan"]);
+    } else {
+      expect(optionIds).toEqual(["acceptEdits", "default", "plan"]);
+    }
+
+    expect(options.find((option) => option.optionId === "plan")).toEqual({
+      kind: "reject_once",
+      name: "No, keep planning",
+      optionId: "plan",
+      _meta: {
+        "anyharness.dev/permissionOptionPresentation": {
+          kind: "feedback_text_input",
+          placeholder: "Tell Claude what to change",
+        },
+      },
+    });
+    for (const option of options.filter((item) => item.optionId !== "plan")) {
+      expect(option).not.toHaveProperty("_meta");
+    }
+  });
+
   it("should include title field in tool permission request structure", () => {
     // Test various tool types to ensure title is correctly generated
     const testCases = [
