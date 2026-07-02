@@ -29,3 +29,13 @@ export {
 
 // Export types
 export type { ClaudePlanEntry } from "./tools.js";
+
+// anyharness GoalPort/LoopPort extension (wire contract v1)
+export {
+  ANYHARNESS_CAPABILITIES,
+  ANYHARNESS_SCHEMA_VERSION,
+  type AnyharnessTranscriptEvent,
+  type GoalWire,
+  type LoopSchedule,
+  type LoopWire,
+} from "./anyharness.js";

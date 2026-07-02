@@ -26,6 +26,7 @@ import {
 } from "../tools.js";
 import { toAcpNotifications, promptToClaude, ClaudeAcpAgent, claudeCliPath } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
+import { newAnyharnessSessionState } from "../anyharness.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 import type {
@@ -1350,6 +1351,7 @@ describe("stop reason propagation", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      anyharness: newAnyharnessSessionState(true),
     };
   }
 
@@ -1491,6 +1493,7 @@ describe("stop reason propagation", () => {
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
+      anyharness: newAnyharnessSessionState(true),
     };
 
     const response = await agent.prompt({
@@ -1566,6 +1569,7 @@ describe("session/close", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return agent.sessions[sessionId]!;
   }

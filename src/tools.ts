@@ -774,13 +774,31 @@ export const createPostToolUseHook =
     logger: Logger = console,
     options?: {
       onEnterPlanMode?: () => Promise<void>;
+      /* Reports the session transcript path carried on every hook input. */
+      onTranscriptPath?: (transcriptPath: string) => void;
+      /* Observes native cron tool executions (CronCreate/CronDelete/CronList). */
+      onCronTool?: (toolName: string, toolInput: unknown, toolResponse: unknown) => Promise<void>;
     },
   ): HookCallback =>
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PostToolUse") {
+      if (typeof input.transcript_path === "string" && options?.onTranscriptPath) {
+        options.onTranscriptPath(input.transcript_path);
+      }
+
       // Handle EnterPlanMode tool - notify client of mode change after successful execution
       if (input.tool_name === "EnterPlanMode" && options?.onEnterPlanMode) {
         await options.onEnterPlanMode();
+      }
+
+      // Observe native session cron tools for anyharness loop bookkeeping.
+      if (
+        (input.tool_name === "CronCreate" ||
+          input.tool_name === "CronDelete" ||
+          input.tool_name === "CronList") &&
+        options?.onCronTool
+      ) {
+        await options.onCronTool(input.tool_name, input.tool_input, input.tool_response);
       }
 
       if (toolUseID) {
