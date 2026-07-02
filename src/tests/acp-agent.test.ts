@@ -39,6 +39,7 @@ import {
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
+import { newAnyharnessSessionState } from "../anyharness.js";
 import {
   deleteSession,
   getSessionMessages,
@@ -1708,6 +1709,7 @@ describe("stop reason propagation", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
   }
 
@@ -1854,6 +1856,7 @@ describe("stop reason propagation", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
 
     const response = await agent.prompt({
@@ -2015,6 +2018,7 @@ describe("session/close", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2101,6 +2105,7 @@ describe("session/delete", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2204,6 +2209,7 @@ describe("getOrCreateSession param change detection", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2441,6 +2447,7 @@ describe("usage_update computation", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
   }
 
@@ -3450,6 +3457,7 @@ describe("assembled assistant text fallback", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
   }
 
@@ -3646,6 +3654,7 @@ describe("emitRawSDKMessages", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
   }
 
@@ -3876,6 +3885,7 @@ describe("result origin handling", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
   }
 
@@ -4053,6 +4063,7 @@ describe("memory_recall handling", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
   }
 
@@ -4285,6 +4296,7 @@ describe("post-error recovery", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return { interrupt };
   }
@@ -4432,6 +4444,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return { interrupt };
   }

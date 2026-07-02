@@ -80,6 +80,23 @@ import {
   extractAskUserQuestions,
   mcpElicitationToCreateRequest,
 } from "./elicitation.js";
+import {
+  activeLoops,
+  ANYHARNESS_CAPABILITIES,
+  ANYHARNESS_SCHEMA_VERSION,
+  AnyharnessSessionState,
+  AnyharnessTranscriptEvent,
+  computeTranscriptPath,
+  extractGoalStatus,
+  GoalWire,
+  goalWireFromState,
+  LoopSchedule,
+  LoopState,
+  LoopWire,
+  loopWireFromState,
+  newAnyharnessSessionState,
+  TranscriptTailer,
+} from "./anyharness.js";
 import { SettingsManager } from "./settings.js";
 import {
   applyTaskCreate,
@@ -96,7 +113,7 @@ import {
   toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
 } from "./tools.js";
-import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+import { nodeToWebReadable, nodeToWebWritable, Pushable, sleep, unreachable } from "./utils.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -233,6 +250,9 @@ type Session = {
    *  client-requested state so config option rebuilds (e.g. on model switch)
    *  can preserve it. Defaults to false (fast mode off). */
   fastModeEnabled?: boolean;
+  /** Goal/loop state + transcript tailer for the anyharness GoalPort/LoopPort
+   *  extension. */
+  anyharness: AnyharnessSessionState;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -398,6 +418,75 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+
+// How long the loop/set and loop/clear ext methods wait for the matching
+// CronCreate/CronDelete tool_use before answering optimistically.
+const LOOP_SET_TIMEOUT_MS = 60_000;
+const LOOP_CLEAR_TIMEOUT_MS = 60_000;
+
+function isProcessExitError(message: string): boolean {
+  return (
+    message.includes("ProcessTransport") ||
+    message.includes("terminated process") ||
+    message.includes("process exited with") ||
+    message.includes("process terminated by signal") ||
+    message.includes("Failed to write to process stdin")
+  );
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/** Extracts the text of a plain user message (used to attribute cron wakes). */
+function userMessageText(content: unknown): string | undefined {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    const texts = content
+      .filter(
+        (block): block is { type: "text"; text: string } =>
+          typeof block === "object" &&
+          block !== null &&
+          block.type === "text" &&
+          typeof block.text === "string",
+      )
+      .map((block) => block.text);
+    if (texts.length > 0) {
+      return texts.join("\n");
+    }
+  }
+  return undefined;
+}
+
+/** Best-effort extraction of the cron job id from CronCreate/CronDelete tool IO. */
+function extractCronId(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ["id", "jobId", "cronId", "job_id", "cron_id"]) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && candidate) {
+      return candidate;
+    }
+    if (typeof candidate === "number") {
+      return String(candidate);
+    }
+  }
+  for (const key of ["job", "cron", "result", "output", "structuredContent"]) {
+    const found = extractCronId(record[key]);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
+}
 
 // The Claude SDK persists local slash command invocations (e.g. `/model`) and
 // their output as user messages in the session transcript, wrapping the
@@ -582,6 +671,9 @@ export class ClaudeAcpAgent implements Agent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+  /** Transcript paths reported by PostToolUse hooks before the session was
+   *  registered, replayed into the tailer once the session exists. */
+  private pendingTranscriptPaths: Map<string, string> = new Map();
 
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
@@ -701,6 +793,10 @@ export class ClaudeAcpAgent implements Agent {
 
     return {
       protocolVersion: 1,
+      // anyharness GoalPort/LoopPort capability advertisement (wire contract v1).
+      _meta: {
+        anyharness: ANYHARNESS_CAPABILITIES,
+      },
       agentCapabilities: {
         _meta: {
           claudeCode: {
@@ -832,56 +928,6 @@ export class ClaudeAcpAgent implements Agent {
       cachedWriteTokens: 0,
     };
 
-    let lastAssistantTotalUsage: number | null = null;
-    let lastAssistantUsage: UsageSnapshot | null = null;
-    let lastAssistantModel: string | null = null;
-    // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
-    // problem, billing), it sets a categorical `error` field on the
-    // `SDKAssistantMessage` that precedes the final `result` message. We
-    // capture it here so the subsequent `RequestError.internalError` can
-    // forward it to clients as structured `data`, sparing them from
-    // pattern-matching on the human-readable message text.
-    let lastAssistantError: SDKAssistantMessageError | undefined;
-    // When a streaming classifier refuses a turn, the assistant message carries
-    // stop_reason "refusal" and structured stop_details. We capture the
-    // human-readable explanation here so the terminal `result` can surface it
-    // to the user (the refused assistant message itself usually has no content)
-    // and report ACP's dedicated `refusal` stop reason.
-    let lastRefusalExplanation: string | null = null;
-    // Tracks whether we're inside a compaction. The SDK emits the terminal
-    // `status` (compact_result success/failed) twice for a single failed
-    // compaction, and the two messages are indistinguishable — so we report the
-    // outcome only while a compaction is in progress, then clear this. A fresh
-    // `compacting` status sets it again, so every distinct compaction (e.g.
-    // repeated auto-compactions in a long turn) is still shown.
-    let compactionInProgress = false;
-    // Holds the Anthropic API message id of the assistant message currently
-    // being streamed, captured from `message_start` so every streamed chunk can
-    // be tagged with it. We use the API message id rather than the
-    // per-`stream_event` uuid because the same id is also present on the
-    // consolidated assistant message and in the persisted transcript — so a turn
-    // keeps the same ACP `messageId` whether it is streamed live or replayed
-    // from history. The per-event uuid is unique per event and never persisted.
-    // A single value suffices because every streaming partial arrives with
-    // `parent_tool_use_id === null` (subagent work is folded into tool-result
-    // messages, never surfaced as partial streams).
-    let currentStreamMessageId: string | undefined;
-    // Per-message-id record of which assistant content actually streamed live via
-    // `stream_event` deltas, split by block type. The `assistant` case below
-    // normally drops `text`/`thinking` blocks on the assumption they already
-    // reached the client as `agent_message_chunk`/`agent_thought_chunk`. That
-    // breaks behind Anthropic-protocol gateways that return a turn as a single
-    // non-streamed block (common with OpenAI-compatible proxies): no
-    // `content_block_delta` fires, so the assembled block is the only copy the
-    // client will ever see. We keep the filter per (id, block type) for content
-    // that did stream, and fall back to forwarding what did not. Split by type so
-    // a gateway that streams text but not thinking (or vice versa) doesn't lose
-    // the un-streamed block. Only top-level (`parent_tool_use_id === null`)
-    // streams are recorded — subagent text is never streamed and must stay
-    // filtered, as it is internal to the tool call.
-    const streamedTextIds = new Set<string>();
-    const streamedThinkingIds = new Set<string>();
-
     const userMessage = promptToClaude(params);
 
     const promptUuid = randomUUID();
@@ -894,7 +940,9 @@ export class ClaudeAcpAgent implements Agent {
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
-    if (session.promptRunning) {
+    if (session.promptRunning || session.anyharness.pumpRunning) {
+      // Either a prompt drain or the idle background pump currently owns the
+      // message stream — queue up and wait for it to hand over.
       session.input.push(userMessage);
       const order = session.nextPendingOrder++;
       const cancelled = await new Promise<boolean>((resolve) => {
@@ -910,9 +958,8 @@ export class ClaudeAcpAgent implements Agent {
     session.promptRunning = true;
     let handedOff = false;
     let errored = false;
-    let stopReason: StopReason = "end_turn";
 
-    // Wake-up channel so cancel() can force this loop to return "cancelled"
+    // Wake-up channel so cancel() can force the drain to return "cancelled"
     // even when query.next() is wedged and never yields again (issue #680).
     const cancelController = new AbortController();
     session.cancelController = cancelController;
@@ -921,727 +968,40 @@ export class ClaudeAcpAgent implements Agent {
     });
 
     try {
-      while (true) {
-        const nextMessage = session.query.next();
-        const next = await Promise.race([nextMessage, cancelled]);
-        if (cancelController.signal.aborted) {
-          // The SDK never yielded after interrupt() (e.g. a wedged TaskOutput
-          // block). Abandon the in-flight next() — swallowing any later
-          // rejection so it can't surface as an unhandled rejection — and
-          // honor the cancel per the ACP contract.
-          void nextMessage.catch(() => {});
+      const outcome = await this.drainTurn({
+        sessionId: params.sessionId,
+        session,
+        owner: "prompt",
+        promptUuid,
+        isLocalOnlyCommand,
+        cancelController,
+        cancelled,
+      });
+      if (outcome.kind === "handed_off") {
+        handedOff = true;
+        // the current loop stops with end_turn,
+        // the loop of the next prompt continues running
+        return { stopReason: "end_turn", usage: sessionUsage(session) };
+      }
+      if (outcome.kind === "stream_ended") {
+        if (session.cancelled) {
           return { stopReason: "cancelled" };
         }
-        const { value: message, done } = next as IteratorResult<SDKMessage, void>;
-
-        if (done || !message) {
-          if (session.cancelled) {
-            return { stopReason: "cancelled" };
-          }
-          break;
-        }
-
-        if (
-          session.emitRawSDKMessages &&
-          shouldEmitRawMessage(session.emitRawSDKMessages, message)
-        ) {
-          await this.client.extNotification("_claude/sdkMessage", {
-            sessionId: params.sessionId,
-            message: message as Record<string, unknown>,
-          });
-        }
-
-        switch (message.type) {
-          case "system":
-            switch (message.subtype) {
-              case "init":
-                break;
-              case "status": {
-                if (message.status === "compacting") {
-                  compactionInProgress = true;
-                  await this.client.sessionUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "Compacting..." },
-                    },
-                  });
-                } else if (message.compact_result === "success" && compactionInProgress) {
-                  // The SDK signals manual `/compact` completion with a status
-                  // message carrying `compact_result`, not the `compact_boundary`
-                  // message (which only fires when there's content to compact).
-                  compactionInProgress = false;
-                  await this.client.sessionUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "\n\nCompacting completed." },
-                    },
-                  });
-                } else if (message.compact_result === "failed" && compactionInProgress) {
-                  compactionInProgress = false;
-                  const reason = message.compact_error ? `: ${message.compact_error}` : ".";
-                  await this.client.sessionUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: `\n\nCompacting failed${reason}` },
-                    },
-                  });
-                }
-                break;
-              }
-              case "compact_boundary": {
-                // Refresh the displayed usage immediately so the client doesn't
-                // keep showing the stale pre-compaction size (e.g. "944k/1m")
-                // right after the user sees "Compacting completed", which is
-                // confusing and wrong.
-                //
-                // Prefer the SDK's authoritative post-compaction `used` via
-                // getContextUsage — it reflects the real retained context
-                // (system prompt + tools + surviving messages), which the
-                // per-message API usage numbers can't give us until the next
-                // turn's result. If the control request fails, fall back to the
-                // used:0 approximation: directionally correct (context just
-                // dropped dramatically) and replaced within seconds by the next
-                // result message.
-                //
-                // `size` keeps coming from session.contextWindowSize (learned
-                // from modelUsage / the model heuristic) — getContextUsage's
-                // window field under-reports extended 1M windows.
-                //
-                // The "Compacting completed." text is emitted from the `status`
-                // handler (keyed on `compact_result`), not here, so the failure
-                // path gets a message too.
-                const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
-                lastAssistantUsage = null;
-                lastAssistantTotalUsage = usedTokens ?? 0;
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "usage_update",
-                    used: lastAssistantTotalUsage,
-                    size: session.contextWindowSize,
-                  },
-                });
-                break;
-              }
-              case "local_command_output": {
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: message.content },
-                  },
-                });
-                break;
-              }
-              case "session_state_changed": {
-                if (message.state === "idle") {
-                  if (session.cancelled) {
-                    stopReason = "cancelled";
-                  }
-                  return { stopReason, usage: sessionUsage(session) };
-                }
-                break;
-              }
-              case "memory_recall": {
-                const isSynthesis = message.mode === "synthesize";
-                const locations = isSynthesis
-                  ? []
-                  : message.memories.map((m) => ({ path: m.path }));
-                const content = isSynthesis
-                  ? message.memories
-                      .filter(
-                        (m): m is (typeof message.memories)[number] & { content: string } =>
-                          typeof m.content === "string",
-                      )
-                      .map((m) => ({
-                        type: "content" as const,
-                        content: { type: "text" as const, text: m.content },
-                      }))
-                  : [];
-                const count = message.memories.length;
-                const title = isSynthesis
-                  ? "Recalled synthesized memory"
-                  : `Recalled ${count} ${count === 1 ? "memory" : "memories"}`;
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "tool_call",
-                    toolCallId: message.uuid,
-                    title,
-                    kind: "read",
-                    status: "completed",
-                    ...(locations.length > 0 && { locations }),
-                    ...(content.length > 0 && { content }),
-                    _meta: {
-                      claudeCode: {
-                        toolName: "memory_recall",
-                        toolResponse: { mode: message.mode },
-                      },
-                    } satisfies ToolUpdateMeta,
-                  },
-                });
-                break;
-              }
-              case "commands_changed": {
-                // Push the full slash-command list after a mid-session change
-                // (e.g. skills discovered dynamically as the agent works in a
-                // subdirectory). The client should REPLACE its cached command
-                // list with this payload: supportedCommands() is captured once
-                // at initialize and never reflects mid-session changes, so we
-                // forward message.commands directly rather than re-querying.
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "available_commands_update",
-                    availableCommands: getAvailableSlashCommands(message.commands),
-                  },
-                });
-                break;
-              }
-              case "mirror_error": {
-                // The SDK failed to persist session history (SessionStore
-                // append rejected/timed out after retry) — potential data loss
-                // the user should know about rather than a silent gap on
-                // resume. Log it and surface a warning in the conversation.
-                this.logger.error(
-                  `Session ${message.session_id}: failed to persist history: ${message.error}`,
-                );
-                break;
-              }
-              case "permission_denied": {
-                // A tool call was auto-denied (by a rule, the classifier,
-                // dontAsk mode, etc.) before running. The tool_use block was
-                // already emitted as a `tool_call`, so mark it failed with the
-                // rejection reason — otherwise the client shows a tool call
-                // that silently never resolves.
-                const reason = message.decision_reason ?? message.message;
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "tool_call_update",
-                    toolCallId: message.tool_use_id,
-                    status: "failed",
-                    content: [
-                      {
-                        type: "content",
-                        content: { type: "text", text: `Permission denied: ${reason}` },
-                      },
-                    ],
-                    _meta: {
-                      claudeCode: {
-                        toolName: message.tool_name,
-                        toolResponse: {
-                          decisionReasonType: message.decision_reason_type,
-                          decisionReason: message.decision_reason,
-                          message: message.message,
-                        },
-                      },
-                    } satisfies ToolUpdateMeta,
-                  },
-                });
-                break;
-              }
-              case "hook_started":
-              case "hook_progress":
-              case "hook_response":
-              case "files_persisted":
-              case "task_started":
-              case "task_notification":
-              case "task_progress":
-              case "task_updated":
-                break;
-              case "elicitation_complete": {
-                // A url-mode MCP elicitation finished server-side. Let the client
-                // dismiss any UI it opened for it. Only meaningful when the
-                // client supports url elicitation; ignore failures otherwise.
-                if (this.clientCapabilities?.elicitation?.url) {
-                  try {
-                    await this.client.unstable_completeElicitation({
-                      elicitationId: message.elicitation_id,
-                    });
-                  } catch (error) {
-                    this.logger.error(`Failed to complete elicitation: ${error}`);
-                  }
-                }
-                break;
-              }
-              case "plugin_install":
-              case "notification":
-              case "api_retry":
-              case "thinking_tokens":
-              case "model_refusal_fallback":
-                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
-                break;
-              default:
-                unreachable(message, this.logger);
-                break;
-            }
-            break;
-          case "result": {
-            // Accumulate usage from this result
-            session.accumulatedUsage.inputTokens += message.usage.input_tokens;
-            session.accumulatedUsage.outputTokens += message.usage.output_tokens;
-            session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
-            session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
-
-            const matchingModelUsage = lastAssistantModel
-              ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
-              : null;
-            // Only overwrite when we have an authoritative value — a miss
-            // (e.g. a turn with no top-level assistant message) would
-            // otherwise discard the window learned on a prior turn and
-            // leave the next prompt's mid-stream updates reporting 200k.
-            if (matchingModelUsage) {
-              session.contextWindowSize = matchingModelUsage.contextWindow;
-            }
-
-            // Task-notification followups are autonomous work triggered by a
-            // task-notification system message, not by the user's prompt.
-            // They should not influence the user-turn lifecycle (stop reason,
-            // slash-command output forwarding) but their cost is real.
-            const isTaskNotification = message.origin?.kind === "task-notification";
-
-            // Send usage_update notification
-            if (lastAssistantTotalUsage !== null) {
-              await this.client.sessionUpdate({
-                sessionId: params.sessionId,
-                update: {
-                  sessionUpdate: "usage_update",
-                  used: lastAssistantTotalUsage,
-                  size: session.contextWindowSize,
-                  cost: {
-                    amount: message.total_cost_usd,
-                    currency: "USD",
-                  },
-                  ...(message.origin && {
-                    _meta: { "_claude/origin": message.origin },
-                  }),
-                },
-              });
-            }
-
-            if (session.cancelled) {
-              if (!isTaskNotification) {
-                stopReason = "cancelled";
-              }
-              break;
-            }
-
-            // A refusal can arrive on any result subtype (and may even set
-            // is_error), so handle it before the subtype switch — otherwise the
-            // is_error throw below would surface it as an internal error. The
-            // refused assistant message carries no visible content, so surface
-            // the classifier's explanation (when available) and report ACP's
-            // dedicated `refusal` stop reason.
-            if (message.stop_reason === "refusal" && !isTaskNotification) {
-              if (lastRefusalExplanation) {
-                await this.client.sessionUpdate({
-                  sessionId: params.sessionId,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: lastRefusalExplanation },
-                  },
-                });
-              }
-              stopReason = "refusal";
-              break;
-            }
-
-            switch (message.subtype) {
-              case "success": {
-                if (message.result.includes("Please run /login")) {
-                  throw RequestError.authRequired();
-                }
-                if (message.stop_reason === "max_tokens") {
-                  if (!isTaskNotification) {
-                    stopReason = "max_tokens";
-                  }
-                  break;
-                }
-                if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.result,
-                  );
-                }
-                // For local-only commands (no model invocation), the result
-                // text is the command output — forward it to the client.
-                // Task-notification followups never originate from a user
-                // slash command, so skip the forwarding for them.
-                if (isLocalOnlyCommand && !isTaskNotification) {
-                  for (const notification of toAcpNotifications(
-                    message.result,
-                    "assistant",
-                    params.sessionId,
-                    session.toolUseCache,
-                    this.client,
-                    this.logger,
-                  )) {
-                    await this.client.sessionUpdate(notification);
-                  }
-                }
-                break;
-              }
-              case "error_during_execution": {
-                if (message.stop_reason === "max_tokens") {
-                  if (!isTaskNotification) {
-                    stopReason = "max_tokens";
-                  }
-                  break;
-                }
-                if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
-                  );
-                }
-                if (!isTaskNotification) {
-                  stopReason = "end_turn";
-                }
-                break;
-              }
-              case "error_max_budget_usd":
-              case "error_max_turns":
-              case "error_max_structured_output_retries":
-                if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
-                  );
-                }
-                if (!isTaskNotification) {
-                  stopReason = "max_turn_requests";
-                }
-                break;
-              default:
-                unreachable(message, this.logger);
-                break;
-            }
-            break;
-          }
-          case "stream_event": {
-            // `message_start` carries the Anthropic API message id; capture it
-            // so the streamed chunks that follow (whose delta events don't carry
-            // it) can all be tagged with the same, replay-stable id.
-            if (message.event.type === "message_start") {
-              currentStreamMessageId = message.event.message.id || undefined;
-            }
-            // Record that this top-level message id actually streamed text/
-            // thinking, so the `assistant` case below knows its assembled blocks
-            // are duplicates (filter them) rather than the only copy (forward
-            // them). Gated on `parent_tool_use_id === null` so a subagent stream
-            // can't attribute its content to the top-level message id.
-            if (
-              currentStreamMessageId &&
-              message.parent_tool_use_id === null &&
-              message.event.type === "content_block_delta"
-            ) {
-              if (message.event.delta.type === "text_delta") {
-                streamedTextIds.add(currentStreamMessageId);
-              } else if (message.event.delta.type === "thinking_delta") {
-                streamedThinkingIds.add(currentStreamMessageId);
-              }
-            }
-            if (
-              message.parent_tool_use_id === null &&
-              (message.event.type === "message_start" || message.event.type === "message_delta")
-            ) {
-              if (message.event.type === "message_start") {
-                lastAssistantUsage = snapshotFromUsage(message.event.message.usage);
-                const model = message.event.message.model;
-                if (model && model !== "<synthetic>") {
-                  lastAssistantModel = model;
-                  // Only upgrade from the default — once a `result` has given
-                  // us an authoritative window, trust it over the heuristic.
-                  // Model switches invalidate the cached window via
-                  // `syncSessionConfigState`, which resets us back to the
-                  // default so this branch runs again for the new model.
-                  if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
-                    const inferred = inferContextWindowFromModel(model);
-                    if (inferred !== null) {
-                      session.contextWindowSize = inferred;
-                    }
-                  }
-                }
-              } else {
-                const usage = message.event.usage;
-                const prev: Readonly<UsageSnapshot> = lastAssistantUsage ?? ZERO_USAGE;
-                // Per Anthropic API, message_delta usage fields are *cumulative*;
-                // nullable fields (input_tokens and the cache fields) fall back
-                // to the prior snapshot when the server omits them from this
-                // delta. Only output_tokens is guaranteed non-null.
-                lastAssistantUsage = {
-                  input_tokens: usage.input_tokens ?? prev.input_tokens,
-                  output_tokens: usage.output_tokens,
-                  cache_read_input_tokens:
-                    usage.cache_read_input_tokens ?? prev.cache_read_input_tokens,
-                  cache_creation_input_tokens:
-                    usage.cache_creation_input_tokens ?? prev.cache_creation_input_tokens,
-                };
-              }
-
-              const nextUsage = totalTokens(lastAssistantUsage);
-              if (nextUsage !== lastAssistantTotalUsage) {
-                lastAssistantTotalUsage = nextUsage;
-                await this.client.sessionUpdate({
-                  sessionId: params.sessionId,
-                  update: {
-                    sessionUpdate: "usage_update",
-                    used: nextUsage,
-                    size: session.contextWindowSize,
-                  },
-                });
-              }
-            }
-            for (const notification of streamEventToAcpNotifications(
-              message,
-              params.sessionId,
-              session.toolUseCache,
-              this.client,
-              this.logger,
-              {
-                clientCapabilities: this.clientCapabilities,
-                cwd: session.cwd,
-                taskState: session.taskState,
-                messageId: currentStreamMessageId,
-              },
-            )) {
-              await this.client.sessionUpdate(notification);
-            }
-            break;
-          }
-          case "user":
-          case "assistant": {
-            if (session.cancelled) {
-              break;
-            }
-
-            // Record the ACP messageId -> SDK uuid mapping for this message. The
-            // consolidated message carries both ids, so this is where we learn
-            // the uuid that the SDK's rewind/resume APIs key on for the id we
-            // hand clients. Not read yet (see Session.messageIdToUuid).
-            const mappedMessageId = messageIdForGrouping(message);
-            if (mappedMessageId && typeof message.uuid === "string" && message.uuid.length > 0) {
-              session.messageIdToUuid.set(mappedMessageId, message.uuid);
-            }
-
-            // Check for prompt replay
-            if (message.type === "user" && "uuid" in message && message.uuid) {
-              if (message.uuid === promptUuid) {
-                break;
-              }
-
-              const pending = session.pendingMessages.get(message.uuid as string);
-              if (pending) {
-                pending.resolve(false);
-                session.pendingMessages.delete(message.uuid as string);
-                handedOff = true;
-                // the current loop stops with end_turn,
-                // the loop of the next prompt continues running
-                return { stopReason: "end_turn", usage: sessionUsage(session) };
-              }
-              if ("isReplay" in message && message.isReplay) {
-                // not pending or unrelated replay message
-                break;
-              }
-            }
-
-            // Snapshot the latest top-level assistant usage and model so the
-            // next `result` can emit a usage_update tied to the right context
-            // window. Subagent messages are excluded to keep the snapshot
-            // aligned with what the user's current selection is producing.
-            if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              lastAssistantUsage = snapshotFromUsage(message.message.usage);
-              lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
-              if (message.message.model && message.message.model !== "<synthetic>") {
-                lastAssistantModel = message.message.model;
-              }
-              if (message.error) {
-                lastAssistantError = message.error;
-              }
-              if (message.message.stop_reason === "refusal") {
-                lastRefusalExplanation = message.message.stop_details?.explanation ?? null;
-              }
-            }
-
-            // Strip <command-*>/<local-command-stdout> markers and render any
-            // remaining prose. Skill bodies and built-in slash commands (e.g.
-            // /usage, /status, /model) arrive wrapped in these tags; pure-marker
-            // payloads (e.g. /compact's malformed output) strip to null and are
-            // skipped. Mirrors the replay path at replaySessionHistory.
-            if (
-              message.message.role !== "system" &&
-              typeof message.message.content === "string" &&
-              message.message.content.includes("<local-command-stdout>")
-            ) {
-              const stripped = stripLocalCommandMetadata(message.message.content);
-              if (typeof stripped === "string") {
-                for (const notification of toAcpNotifications(
-                  stripped,
-                  message.message.role,
-                  params.sessionId,
-                  session.toolUseCache,
-                  this.client,
-                  this.logger,
-                  {
-                    clientCapabilities: this.clientCapabilities,
-                    parentToolUseId: message.parent_tool_use_id,
-                    cwd: session.cwd,
-                    taskState: session.taskState,
-                    messageId: messageIdForGrouping(message),
-                  },
-                )) {
-                  await this.client.sessionUpdate(notification);
-                }
-              } else {
-                this.logger.log(message.message.content);
-              }
-              break;
-            }
-
-            if (
-              typeof message.message.content === "string" &&
-              message.message.content.includes("<local-command-stderr>")
-            ) {
-              this.logger.error(message.message.content);
-              break;
-            }
-            // Skip these user messages for now, since they seem to just be messages we don't want in the feed
-            if (
-              message.type === "user" &&
-              (typeof message.message.content === "string" ||
-                (Array.isArray(message.message.content) &&
-                  message.message.content.length === 1 &&
-                  message.message.content[0].type === "text"))
-            ) {
-              break;
-            }
-            if (message.message.role === "system") {
-              break;
-            }
-
-            if (
-              message.type === "assistant" &&
-              message.message.model === "<synthetic>" &&
-              Array.isArray(message.message.content) &&
-              message.message.content.length === 1 &&
-              message.message.content[0].type === "text" &&
-              message.message.content[0].text.includes("Please run /login")
-            ) {
-              throw RequestError.authRequired();
-            }
-
-            let content: typeof message.message.content;
-            if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              // Top-level assistant message: drop text/thinking blocks already
-              // streamed live as chunks, and forward (as a fallback) any that were
-              // not, so non-streaming gateways still deliver the final answer.
-              const id = messageIdForGrouping(message);
-              content = message.message.content.filter((item) => {
-                // Non-text blocks (tool_use, etc.) always pass through; their own
-                // dedupe (`toolUseCache`) collapses the streamed/assembled pair.
-                if (item.type !== "text" && item.type !== "thinking") {
-                  return true;
-                }
-                // Already delivered live as a chunk of this exact type — drop the
-                // duplicate. Checked per type so streaming one (e.g. text) doesn't
-                // suppress an un-streamed block of the other (e.g. thinking).
-                const streamedLive =
-                  id !== undefined &&
-                  (item.type === "text" ? streamedTextIds : streamedThinkingIds).has(id);
-                if (streamedLive) {
-                  return false;
-                }
-                // Empty assembled blocks carry nothing (some gateways emit an empty
-                // `thinking` block before the real text) — don't forward stray
-                // empty chunks.
-                const text = item.type === "text" ? item.text : item.thinking;
-                if (text.length === 0) {
-                  return false;
-                }
-                return true;
-              });
-            } else if (message.type === "assistant") {
-              // Subagent assistant message (`parent_tool_use_id !== null`). It is
-              // never streamed live and its text/thinking is internal to the tool
-              // call — keep dropping it so subagent prose doesn't leak into the
-              // top-level feed.
-              content = message.message.content.filter(
-                (item) => item.type !== "text" && item.type !== "thinking",
-              );
-            } else {
-              content = message.message.content;
-            }
-
-            for (const notification of toAcpNotifications(
-              content,
-              message.message.role,
-              params.sessionId,
-              session.toolUseCache,
-              this.client,
-              this.logger,
-              {
-                clientCapabilities: this.clientCapabilities,
-                parentToolUseId: message.parent_tool_use_id,
-                cwd: session.cwd,
-                taskState: session.taskState,
-                messageId: messageIdForGrouping(message),
-              },
-            )) {
-              await this.client.sessionUpdate(notification);
-            }
-            break;
-          }
-          case "tool_progress": {
-            await this.client.sessionUpdate({
-              sessionId: message.session_id,
-              update: {
-                sessionUpdate: "tool_call_update",
-                toolCallId: message.tool_use_id,
-                status: "in_progress",
-                _meta: {
-                  claudeCode: {
-                    toolName: message.tool_name,
-                    toolResponse: { elapsedTimeSeconds: message.elapsed_time_seconds },
-                  },
-                } satisfies ToolUpdateMeta,
-              },
-            });
-            break;
-          }
-          case "rate_limit_event": {
-            if (lastAssistantTotalUsage !== null) {
-              await this.client.sessionUpdate({
-                sessionId: message.session_id,
-                update: {
-                  sessionUpdate: "usage_update",
-                  used: lastAssistantTotalUsage,
-                  size: session.contextWindowSize,
-                  _meta: { "_claude/rateLimit": message.rate_limit_info },
-                },
-              });
-            }
-            break;
-          }
-          case "tool_use_summary":
-          case "auth_status":
-          case "prompt_suggestion":
-            break;
-          default:
-            unreachable(message);
-            break;
-        }
+        throw new Error("Session did not end in result");
       }
-      throw new Error("Session did not end in result");
+      // The #680 force-cancel backstop (a wedged query.next() that never
+      // yielded) resolves as "cancelled" with no meaningful usage — match the
+      // wedge-recovery contract by returning the bare stop reason.
+      if (cancelController.signal.aborted) {
+        return { stopReason: "cancelled" };
+      }
+      return { stopReason: outcome.stopReason, usage: sessionUsage(session) };
     } catch (error) {
       errored = true;
       // A failed turn typically leaves a trailing `session_state_changed: idle`
       // (and possibly more) in the query iterator. If we don't drain it here,
       // the next prompt's first `query.next()` consumes that stale idle and
-      // short-circuits to end_turn with zero usage
+      // short-circuits to end_turn with zero usage.
       // Bounded so a misbehaving SDK can't hang the next prompt indefinitely.
       try {
         await session.query.interrupt();
@@ -1669,15 +1029,10 @@ export class ClaudeAcpAgent implements Agent {
         throw error;
       }
       const message = error.message;
-      if (
-        message.includes("ProcessTransport") ||
-        message.includes("terminated process") ||
-        message.includes("process exited with") ||
-        message.includes("process terminated by signal") ||
-        message.includes("Failed to write to process stdin")
-      ) {
+      if (isProcessExitError(message)) {
         this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
         session.settingsManager.dispose();
+        session.anyharness.tailer?.dispose();
         session.input.end();
         delete this.sessions[params.sessionId];
         throw RequestError.internalError(
@@ -1687,7 +1042,7 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw error;
     } finally {
-      // The loop is returning — interrupt() succeeded or the prompt finished
+      // The drain is returning — interrupt() succeeded or the prompt finished
       // — so disarm the force-cancel backstop and release the wake-up channel
       // (only if we still own it; a handoff installs the next prompt's).
       if (session.forceCancelTimer) {
@@ -1720,8 +1075,1384 @@ export class ClaudeAcpAgent implements Agent {
             session.pendingMessages.delete(next[0]);
           }
         }
+        // Resume the idle background pump so injected goal/loop instructions
+        // and spontaneous cron wake turns keep draining between prompts.
+        this.startIdlePump(params.sessionId);
       }
     }
+  }
+
+  /**
+   * Drains SDK messages for one turn, translating them into ACP session
+   * updates. Shared between prompt() and the idle background pump.
+   *
+   * Returns when:
+   * - the harness goes idle (turn ended),
+   * - a queued prompt's user message replay is observed (handed off to the
+   *   prompt() call awaiting it), or
+   * - the SDK message stream ends.
+   */
+  private async drainTurn(params: {
+    sessionId: string;
+    session: Session;
+    owner: "prompt" | "pump";
+    promptUuid?: string;
+    isLocalOnlyCommand?: boolean;
+    cancelController?: AbortController;
+    cancelled?: Promise<void>;
+  }): Promise<
+    | { kind: "turn_ended"; stopReason: StopReason }
+    | { kind: "handed_off" }
+    | { kind: "stream_ended" }
+  > {
+    const session = params.session;
+    const promptUuid = params.promptUuid;
+    const isLocalOnlyCommand = params.isLocalOnlyCommand === true;
+
+    let stopReason: StopReason = "end_turn";
+    let lastAssistantTotalUsage: number | null = null;
+    let lastAssistantUsage: UsageSnapshot | null = null;
+    let lastAssistantModel: string | null = null;
+    // See prompt() history: categorical SDK error captured for structured data.
+    let lastAssistantError: SDKAssistantMessageError | undefined;
+    // Human-readable refusal explanation surfaced on the terminal result.
+    let lastRefusalExplanation: string | null = null;
+    // Tracks whether we're inside a compaction (the SDK emits the terminal
+    // compact_result status twice for a single failed compaction).
+    let compactionInProgress = false;
+    // Anthropic API message id of the assistant message currently streaming.
+    let currentStreamMessageId: string | undefined;
+    // Per-message-id record of which assistant content streamed live, so the
+    // `assistant` case can drop duplicates but forward un-streamed blocks.
+    const streamedTextIds = new Set<string>();
+    const streamedThinkingIds = new Set<string>();
+
+    // Classification of a turn drained by the idle pump:
+    // - "injected": triggered by a goal/loop instruction we pushed ourselves
+    // - "wake": a spontaneous native cron wake turn (emits loop_fired)
+    // - "plain": spontaneous activity with no loop armed
+    let turnKind: "unknown" | "injected" | "wake" | "plain" = "unknown";
+    const markSpontaneousTurn = async (userText?: string) => {
+      if (params.owner !== "pump" || turnKind !== "unknown") {
+        return;
+      }
+      const loops = activeLoops(session.anyharness);
+      if (loops.length === 0) {
+        turnKind = "plain";
+        return;
+      }
+      let loop: LoopState | undefined;
+      if (userText) {
+        loop = loops.find((l) => userText.includes(l.prompt) || l.prompt.includes(userText));
+        if (!loop) {
+          // A user message matching no armed loop prompt isn't enough
+          // evidence of a wake — wait for assistant activity.
+          return;
+        }
+      } else {
+        loop = loops[0];
+        if (loops.length > 1) {
+          this.logger.error(
+            `[anyharness] ambiguous cron wake (${loops.length} loops armed); attributing to ${loop.loopId}`,
+          );
+        }
+      }
+      turnKind = "wake";
+      const now = Date.now();
+      loop.fireCount += 1;
+      loop.lastFiredAtMs = now;
+      loop.updatedAtMs = now;
+      await this.sendAnyharnessEvent(params.sessionId, "loop_fired", {
+        loop: loopWireFromState(loop),
+        loopId: loop.loopId,
+      });
+    };
+
+    while (true) {
+      const nextMessage = session.query.next();
+      let iteration: IteratorResult<SDKMessage, void>;
+      if (params.owner === "prompt" && params.cancelled) {
+        const next = await Promise.race([nextMessage, params.cancelled]);
+        if (params.cancelController?.signal.aborted) {
+          // The SDK never yielded after interrupt() (e.g. a wedged TaskOutput
+          // block — issue #680). Abandon the in-flight next() — swallowing any
+          // later rejection so it can't surface as an unhandled rejection — and
+          // honor the cancel per the ACP contract.
+          void nextMessage.catch(() => {});
+          return { kind: "turn_ended", stopReason: "cancelled" };
+        }
+        iteration = next as IteratorResult<SDKMessage, void>;
+      } else {
+        iteration = await nextMessage;
+      }
+      const { value: message, done } = iteration;
+
+      if (done || !message) {
+        return { kind: "stream_ended" };
+      }
+
+      if (session.emitRawSDKMessages && shouldEmitRawMessage(session.emitRawSDKMessages, message)) {
+        await this.client.extNotification("_claude/sdkMessage", {
+          sessionId: params.sessionId,
+          message: message as Record<string, unknown>,
+        });
+      }
+
+      switch (message.type) {
+        case "system":
+          switch (message.subtype) {
+            case "init":
+              break;
+            case "status": {
+              if (message.status === "compacting") {
+                compactionInProgress = true;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: "Compacting..." },
+                  },
+                });
+              } else if (message.compact_result === "success" && compactionInProgress) {
+                // The SDK signals manual `/compact` completion with a status
+                // message carrying `compact_result`, not the `compact_boundary`
+                // message (which only fires when there's content to compact).
+                compactionInProgress = false;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: "\n\nCompacting completed." },
+                  },
+                });
+              } else if (message.compact_result === "failed" && compactionInProgress) {
+                compactionInProgress = false;
+                const reason = message.compact_error ? `: ${message.compact_error}` : ".";
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: `\n\nCompacting failed${reason}` },
+                  },
+                });
+              }
+              break;
+            }
+            case "compact_boundary": {
+              // Refresh the displayed usage immediately so the client doesn't
+              // keep showing the stale pre-compaction size (e.g. "944k/1m")
+              // right after the user sees "Compacting completed", which is
+              // confusing and wrong.
+              //
+              // Prefer the SDK's authoritative post-compaction `used` via
+              // getContextUsage — it reflects the real retained context
+              // (system prompt + tools + surviving messages), which the
+              // per-message API usage numbers can't give us until the next
+              // turn's result. If the control request fails, fall back to the
+              // used:0 approximation: directionally correct (context just
+              // dropped dramatically) and replaced within seconds by the next
+              // result message.
+              //
+              // `size` keeps coming from session.contextWindowSize (learned
+              // from modelUsage / the model heuristic) — getContextUsage's
+              // window field under-reports extended 1M windows.
+              //
+              // The "Compacting completed." text is emitted from the `status`
+              // handler (keyed on `compact_result`), not here, so the failure
+              // path gets a message too.
+              const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
+              lastAssistantUsage = null;
+              lastAssistantTotalUsage = usedTokens ?? 0;
+              await this.client.sessionUpdate({
+                sessionId: message.session_id,
+                update: {
+                  sessionUpdate: "usage_update",
+                  used: lastAssistantTotalUsage,
+                  size: session.contextWindowSize,
+                },
+              });
+              break;
+            }
+            case "local_command_output": {
+              await this.client.sessionUpdate({
+                sessionId: message.session_id,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: message.content },
+                },
+              });
+              break;
+            }
+            case "session_state_changed": {
+              if (message.state === "idle") {
+                if (session.cancelled) {
+                  stopReason = "cancelled";
+                }
+                return { kind: "turn_ended", stopReason };
+              }
+              break;
+            }
+            case "memory_recall": {
+              const isSynthesis = message.mode === "synthesize";
+              const locations = isSynthesis ? [] : message.memories.map((m) => ({ path: m.path }));
+              const content = isSynthesis
+                ? message.memories
+                    .filter(
+                      (m): m is (typeof message.memories)[number] & { content: string } =>
+                        typeof m.content === "string",
+                    )
+                    .map((m) => ({
+                      type: "content" as const,
+                      content: { type: "text" as const, text: m.content },
+                    }))
+                : [];
+              const count = message.memories.length;
+              const title = isSynthesis
+                ? "Recalled synthesized memory"
+                : `Recalled ${count} ${count === 1 ? "memory" : "memories"}`;
+              await this.client.sessionUpdate({
+                sessionId: message.session_id,
+                update: {
+                  sessionUpdate: "tool_call",
+                  toolCallId: message.uuid,
+                  title,
+                  kind: "read",
+                  status: "completed",
+                  ...(locations.length > 0 && { locations }),
+                  ...(content.length > 0 && { content }),
+                  _meta: {
+                    claudeCode: {
+                      toolName: "memory_recall",
+                      toolResponse: { mode: message.mode },
+                    },
+                  } satisfies ToolUpdateMeta,
+                },
+              });
+              break;
+            }
+            case "commands_changed": {
+              // Push the full slash-command list after a mid-session change
+              // (e.g. skills discovered dynamically as the agent works in a
+              // subdirectory). The client should REPLACE its cached command
+              // list with this payload: supportedCommands() is captured once
+              // at initialize and never reflects mid-session changes, so we
+              // forward message.commands directly rather than re-querying.
+              await this.client.sessionUpdate({
+                sessionId: message.session_id,
+                update: {
+                  sessionUpdate: "available_commands_update",
+                  availableCommands: getAvailableSlashCommands(message.commands),
+                },
+              });
+              break;
+            }
+            case "mirror_error": {
+              // The SDK failed to persist session history (SessionStore
+              // append rejected/timed out after retry) — potential data loss
+              // the user should know about rather than a silent gap on
+              // resume. Log it and surface a warning in the conversation.
+              this.logger.error(
+                `Session ${message.session_id}: failed to persist history: ${message.error}`,
+              );
+              break;
+            }
+            case "permission_denied": {
+              // A tool call was auto-denied (by a rule, the classifier,
+              // dontAsk mode, etc.) before running. The tool_use block was
+              // already emitted as a `tool_call`, so mark it failed with the
+              // rejection reason — otherwise the client shows a tool call
+              // that silently never resolves.
+              const reason = message.decision_reason ?? message.message;
+              await this.client.sessionUpdate({
+                sessionId: message.session_id,
+                update: {
+                  sessionUpdate: "tool_call_update",
+                  toolCallId: message.tool_use_id,
+                  status: "failed",
+                  content: [
+                    {
+                      type: "content",
+                      content: { type: "text", text: `Permission denied: ${reason}` },
+                    },
+                  ],
+                  _meta: {
+                    claudeCode: {
+                      toolName: message.tool_name,
+                      toolResponse: {
+                        decisionReasonType: message.decision_reason_type,
+                        decisionReason: message.decision_reason,
+                        message: message.message,
+                      },
+                    },
+                  } satisfies ToolUpdateMeta,
+                },
+              });
+              break;
+            }
+            case "hook_started":
+            case "hook_progress":
+            case "hook_response":
+            case "files_persisted":
+            case "task_started":
+            case "task_notification":
+            case "task_progress":
+            case "task_updated":
+              break;
+            case "elicitation_complete": {
+              // A url-mode MCP elicitation finished server-side. Let the client
+              // dismiss any UI it opened for it. Only meaningful when the
+              // client supports url elicitation; ignore failures otherwise.
+              if (this.clientCapabilities?.elicitation?.url) {
+                try {
+                  await this.client.unstable_completeElicitation({
+                    elicitationId: message.elicitation_id,
+                  });
+                } catch (error) {
+                  this.logger.error(`Failed to complete elicitation: ${error}`);
+                }
+              }
+              break;
+            }
+            case "plugin_install":
+            case "notification":
+            case "api_retry":
+            case "thinking_tokens":
+            case "model_refusal_fallback":
+              // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+              break;
+            default:
+              unreachable(message, this.logger);
+              break;
+          }
+          break;
+        case "result": {
+          // Accumulate usage from this result
+          session.accumulatedUsage.inputTokens += message.usage.input_tokens;
+          session.accumulatedUsage.outputTokens += message.usage.output_tokens;
+          session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
+          session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
+
+          const matchingModelUsage = lastAssistantModel
+            ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
+            : null;
+          // Only overwrite when we have an authoritative value — a miss
+          // (e.g. a turn with no top-level assistant message) would
+          // otherwise discard the window learned on a prior turn and
+          // leave the next prompt's mid-stream updates reporting 200k.
+          if (matchingModelUsage) {
+            session.contextWindowSize = matchingModelUsage.contextWindow;
+          }
+
+          // Task-notification followups are autonomous work triggered by a
+          // task-notification system message, not by the user's prompt.
+          // They should not influence the user-turn lifecycle (stop reason,
+          // slash-command output forwarding) but their cost is real.
+          const isTaskNotification = message.origin?.kind === "task-notification";
+
+          // Send usage_update notification
+          if (lastAssistantTotalUsage !== null) {
+            await this.client.sessionUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "usage_update",
+                used: lastAssistantTotalUsage,
+                size: session.contextWindowSize,
+                cost: {
+                  amount: message.total_cost_usd,
+                  currency: "USD",
+                },
+                ...(message.origin && {
+                  _meta: { "_claude/origin": message.origin },
+                }),
+              },
+            });
+          }
+
+          if (session.cancelled) {
+            if (!isTaskNotification) {
+              stopReason = "cancelled";
+            }
+            break;
+          }
+
+          // A refusal can arrive on any result subtype (and may even set
+          // is_error), so handle it before the subtype switch — otherwise the
+          // is_error throw below would surface it as an internal error. The
+          // refused assistant message carries no visible content, so surface
+          // the classifier's explanation (when available) and report ACP's
+          // dedicated `refusal` stop reason.
+          if (message.stop_reason === "refusal" && !isTaskNotification) {
+            if (lastRefusalExplanation) {
+              await this.client.sessionUpdate({
+                sessionId: params.sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: lastRefusalExplanation },
+                },
+              });
+            }
+            stopReason = "refusal";
+            break;
+          }
+
+          switch (message.subtype) {
+            case "success": {
+              if (message.result.includes("Please run /login")) {
+                throw RequestError.authRequired();
+              }
+              if (message.stop_reason === "max_tokens") {
+                if (!isTaskNotification) {
+                  stopReason = "max_tokens";
+                }
+                break;
+              }
+              if (message.is_error) {
+                throw RequestError.internalError(errorKindData(lastAssistantError), message.result);
+              }
+              // For local-only commands (no model invocation), the result
+              // text is the command output — forward it to the client.
+              // Task-notification followups never originate from a user
+              // slash command, so skip the forwarding for them.
+              if (isLocalOnlyCommand && !isTaskNotification) {
+                for (const notification of toAcpNotifications(
+                  message.result,
+                  "assistant",
+                  params.sessionId,
+                  session.toolUseCache,
+                  this.client,
+                  this.logger,
+                )) {
+                  await this.client.sessionUpdate(notification);
+                }
+              }
+              break;
+            }
+            case "error_during_execution": {
+              if (message.stop_reason === "max_tokens") {
+                if (!isTaskNotification) {
+                  stopReason = "max_tokens";
+                }
+                break;
+              }
+              if (message.is_error) {
+                throw RequestError.internalError(
+                  errorKindData(lastAssistantError),
+                  message.errors.join(", ") || message.subtype,
+                );
+              }
+              if (!isTaskNotification) {
+                stopReason = "end_turn";
+              }
+              break;
+            }
+            case "error_max_budget_usd":
+            case "error_max_turns":
+            case "error_max_structured_output_retries":
+              if (message.is_error) {
+                throw RequestError.internalError(
+                  errorKindData(lastAssistantError),
+                  message.errors.join(", ") || message.subtype,
+                );
+              }
+              if (!isTaskNotification) {
+                stopReason = "max_turn_requests";
+              }
+              break;
+            default:
+              unreachable(message, this.logger);
+              break;
+          }
+          break;
+        }
+        case "stream_event": {
+          await markSpontaneousTurn();
+          // `message_start` carries the Anthropic API message id; capture it
+          // so the streamed chunks that follow (whose delta events don't carry
+          // it) can all be tagged with the same, replay-stable id.
+          if (message.event.type === "message_start") {
+            currentStreamMessageId = message.event.message.id || undefined;
+          }
+          // Record that this top-level message id actually streamed text/
+          // thinking, so the `assistant` case below knows its assembled blocks
+          // are duplicates (filter them) rather than the only copy (forward
+          // them). Gated on `parent_tool_use_id === null` so a subagent stream
+          // can't attribute its content to the top-level message id.
+          if (
+            currentStreamMessageId &&
+            message.parent_tool_use_id === null &&
+            message.event.type === "content_block_delta"
+          ) {
+            if (message.event.delta.type === "text_delta") {
+              streamedTextIds.add(currentStreamMessageId);
+            } else if (message.event.delta.type === "thinking_delta") {
+              streamedThinkingIds.add(currentStreamMessageId);
+            }
+          }
+          if (
+            message.parent_tool_use_id === null &&
+            (message.event.type === "message_start" || message.event.type === "message_delta")
+          ) {
+            if (message.event.type === "message_start") {
+              lastAssistantUsage = snapshotFromUsage(message.event.message.usage);
+              const model = message.event.message.model;
+              if (model && model !== "<synthetic>") {
+                lastAssistantModel = model;
+                // Only upgrade from the default — once a `result` has given
+                // us an authoritative window, trust it over the heuristic.
+                // Model switches invalidate the cached window via
+                // `syncSessionConfigState`, which resets us back to the
+                // default so this branch runs again for the new model.
+                if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
+                  const inferred = inferContextWindowFromModel(model);
+                  if (inferred !== null) {
+                    session.contextWindowSize = inferred;
+                  }
+                }
+              }
+            } else {
+              const usage = message.event.usage;
+              const prev: Readonly<UsageSnapshot> = lastAssistantUsage ?? ZERO_USAGE;
+              // Per Anthropic API, message_delta usage fields are *cumulative*;
+              // nullable fields (input_tokens and the cache fields) fall back
+              // to the prior snapshot when the server omits them from this
+              // delta. Only output_tokens is guaranteed non-null.
+              lastAssistantUsage = {
+                input_tokens: usage.input_tokens ?? prev.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_input_tokens:
+                  usage.cache_read_input_tokens ?? prev.cache_read_input_tokens,
+                cache_creation_input_tokens:
+                  usage.cache_creation_input_tokens ?? prev.cache_creation_input_tokens,
+              };
+            }
+
+            const nextUsage = totalTokens(lastAssistantUsage);
+            if (nextUsage !== lastAssistantTotalUsage) {
+              lastAssistantTotalUsage = nextUsage;
+              await this.client.sessionUpdate({
+                sessionId: params.sessionId,
+                update: {
+                  sessionUpdate: "usage_update",
+                  used: nextUsage,
+                  size: session.contextWindowSize,
+                },
+              });
+            }
+          }
+          for (const notification of streamEventToAcpNotifications(
+            message,
+            params.sessionId,
+            session.toolUseCache,
+            this.client,
+            this.logger,
+            {
+              clientCapabilities: this.clientCapabilities,
+              cwd: session.cwd,
+              taskState: session.taskState,
+              messageId: currentStreamMessageId,
+            },
+          )) {
+            await this.client.sessionUpdate(notification);
+          }
+          break;
+        }
+        case "user":
+        case "assistant": {
+          if (session.cancelled) {
+            break;
+          }
+
+          if (message.type === "assistant") {
+            await markSpontaneousTurn();
+          }
+
+          // Record the ACP messageId -> SDK uuid mapping for this message. The
+          // consolidated message carries both ids, so this is where we learn
+          // the uuid that the SDK's rewind/resume APIs key on for the id we
+          // hand clients. Not read yet (see Session.messageIdToUuid).
+          const mappedMessageId = messageIdForGrouping(message);
+          if (mappedMessageId && typeof message.uuid === "string" && message.uuid.length > 0) {
+            session.messageIdToUuid.set(mappedMessageId, message.uuid);
+          }
+
+          // Check for prompt replay
+          if (message.type === "user" && "uuid" in message && message.uuid) {
+            if (message.uuid === promptUuid) {
+              break;
+            }
+
+            const pending = session.pendingMessages.get(message.uuid as string);
+            if (pending) {
+              pending.resolve(false);
+              session.pendingMessages.delete(message.uuid as string);
+              // the current loop stops with end_turn,
+              // the loop of the next prompt continues running
+              return { kind: "handed_off" };
+            }
+            if (session.anyharness.injectedUuids.has(message.uuid as string)) {
+              // Replay of a goal/loop instruction we injected — not a cron
+              // wake, and not content the client should see.
+              session.anyharness.injectedUuids.delete(message.uuid as string);
+              turnKind = "injected";
+              break;
+            }
+            if (params.owner === "pump" && turnKind === "unknown") {
+              // A spontaneous user message may be a native cron wake prompt.
+              await markSpontaneousTurn(userMessageText(message.message.content));
+            }
+            if ("isReplay" in message && message.isReplay) {
+              // not pending or unrelated replay message
+              break;
+            }
+          }
+
+          // Snapshot the latest top-level assistant usage and model so the
+          // next `result` can emit a usage_update tied to the right context
+          // window. Subagent messages are excluded to keep the snapshot
+          // aligned with what the user's current selection is producing.
+          if (message.type === "assistant" && message.parent_tool_use_id === null) {
+            lastAssistantUsage = snapshotFromUsage(message.message.usage);
+            lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
+            if (message.message.model && message.message.model !== "<synthetic>") {
+              lastAssistantModel = message.message.model;
+            }
+            if (message.error) {
+              lastAssistantError = message.error;
+            }
+            if (message.message.stop_reason === "refusal") {
+              lastRefusalExplanation = message.message.stop_details?.explanation ?? null;
+            }
+          }
+
+          // Strip <command-*>/<local-command-stdout> markers and render any
+          // remaining prose. Skill bodies and built-in slash commands (e.g.
+          // /usage, /status, /model) arrive wrapped in these tags; pure-marker
+          // payloads (e.g. /compact's malformed output) strip to null and are
+          // skipped. Mirrors the replay path at replaySessionHistory.
+          if (
+            message.message.role !== "system" &&
+            typeof message.message.content === "string" &&
+            message.message.content.includes("<local-command-stdout>")
+          ) {
+            const stripped = stripLocalCommandMetadata(message.message.content);
+            if (typeof stripped === "string") {
+              for (const notification of toAcpNotifications(
+                stripped,
+                message.message.role,
+                params.sessionId,
+                session.toolUseCache,
+                this.client,
+                this.logger,
+                {
+                  clientCapabilities: this.clientCapabilities,
+                  parentToolUseId: message.parent_tool_use_id,
+                  cwd: session.cwd,
+                  taskState: session.taskState,
+                  messageId: messageIdForGrouping(message),
+                },
+              )) {
+                await this.client.sessionUpdate(notification);
+              }
+            } else {
+              this.logger.log(message.message.content);
+            }
+            break;
+          }
+
+          if (
+            typeof message.message.content === "string" &&
+            message.message.content.includes("<local-command-stderr>")
+          ) {
+            this.logger.error(message.message.content);
+            break;
+          }
+          // Skip these user messages for now, since they seem to just be messages we don't want in the feed
+          if (
+            message.type === "user" &&
+            (typeof message.message.content === "string" ||
+              (Array.isArray(message.message.content) &&
+                message.message.content.length === 1 &&
+                message.message.content[0].type === "text"))
+          ) {
+            break;
+          }
+          if (message.message.role === "system") {
+            break;
+          }
+
+          if (
+            message.type === "assistant" &&
+            message.message.model === "<synthetic>" &&
+            Array.isArray(message.message.content) &&
+            message.message.content.length === 1 &&
+            message.message.content[0].type === "text" &&
+            message.message.content[0].text.includes("Please run /login")
+          ) {
+            throw RequestError.authRequired();
+          }
+
+          let content: typeof message.message.content;
+          if (message.type === "assistant" && message.parent_tool_use_id === null) {
+            // Top-level assistant message: drop text/thinking blocks already
+            // streamed live as chunks, and forward (as a fallback) any that were
+            // not, so non-streaming gateways still deliver the final answer.
+            const id = messageIdForGrouping(message);
+            content = message.message.content.filter((item) => {
+              // Non-text blocks (tool_use, etc.) always pass through; their own
+              // dedupe (`toolUseCache`) collapses the streamed/assembled pair.
+              if (item.type !== "text" && item.type !== "thinking") {
+                return true;
+              }
+              // Already delivered live as a chunk of this exact type — drop the
+              // duplicate. Checked per type so streaming one (e.g. text) doesn't
+              // suppress an un-streamed block of the other (e.g. thinking).
+              const streamedLive =
+                id !== undefined &&
+                (item.type === "text" ? streamedTextIds : streamedThinkingIds).has(id);
+              if (streamedLive) {
+                return false;
+              }
+              // Empty assembled blocks carry nothing (some gateways emit an empty
+              // `thinking` block before the real text) — don't forward stray
+              // empty chunks.
+              const text = item.type === "text" ? item.text : item.thinking;
+              if (text.length === 0) {
+                return false;
+              }
+              return true;
+            });
+          } else if (message.type === "assistant") {
+            // Subagent assistant message (`parent_tool_use_id !== null`). It is
+            // never streamed live and its text/thinking is internal to the tool
+            // call — keep dropping it so subagent prose doesn't leak into the
+            // top-level feed.
+            content = message.message.content.filter(
+              (item) => item.type !== "text" && item.type !== "thinking",
+            );
+          } else {
+            content = message.message.content;
+          }
+
+          for (const notification of toAcpNotifications(
+            content,
+            message.message.role,
+            params.sessionId,
+            session.toolUseCache,
+            this.client,
+            this.logger,
+            {
+              clientCapabilities: this.clientCapabilities,
+              parentToolUseId: message.parent_tool_use_id,
+              cwd: session.cwd,
+              taskState: session.taskState,
+              messageId: messageIdForGrouping(message),
+            },
+          )) {
+            await this.client.sessionUpdate(notification);
+          }
+          break;
+        }
+        case "tool_progress": {
+          await this.client.sessionUpdate({
+            sessionId: message.session_id,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: message.tool_use_id,
+              status: "in_progress",
+              _meta: {
+                claudeCode: {
+                  toolName: message.tool_name,
+                  toolResponse: { elapsedTimeSeconds: message.elapsed_time_seconds },
+                },
+              } satisfies ToolUpdateMeta,
+            },
+          });
+          break;
+        }
+        case "rate_limit_event": {
+          if (lastAssistantTotalUsage !== null) {
+            await this.client.sessionUpdate({
+              sessionId: message.session_id,
+              update: {
+                sessionUpdate: "usage_update",
+                used: lastAssistantTotalUsage,
+                size: session.contextWindowSize,
+                _meta: { "_claude/rateLimit": message.rate_limit_info },
+              },
+            });
+          }
+          break;
+        }
+        case "tool_use_summary":
+        case "auth_status":
+        case "prompt_suggestion":
+          break;
+        default:
+          unreachable(message);
+          break;
+      }
+    }
+  }
+
+  /**
+   * Background pump: drains the SDK message stream while no client prompt()
+   * is running, so injected goal/loop instructions are processed while idle
+   * and spontaneous native cron wake turns are translated as they happen.
+   */
+  private startIdlePump(sessionId: string): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const ah = session.anyharness;
+    if (ah.pumpRunning || session.promptRunning) {
+      return;
+    }
+    ah.pumpRunning = true;
+    void this.runIdlePump(sessionId, session)
+      .catch((error) => {
+        this.logger.error(`[anyharness] idle pump for session ${sessionId} crashed:`, error);
+      })
+      .finally(() => {
+        ah.pumpRunning = false;
+        // If a prompt queued up while the pump was dying, unstick it the same
+        // way prompt() unsticks the next pending prompt.
+        if (
+          this.sessions[sessionId] === session &&
+          !session.promptRunning &&
+          session.pendingMessages.size > 0
+        ) {
+          const next = [...session.pendingMessages.entries()].sort(
+            (a, b) => a[1].order - b[1].order,
+          )[0];
+          if (next) {
+            next[1].resolve(false);
+            session.pendingMessages.delete(next[0]);
+          }
+        }
+      });
+  }
+
+  private async runIdlePump(sessionId: string, session: Session): Promise<void> {
+    while (true) {
+      if (this.sessions[sessionId] !== session || session.promptRunning) {
+        return;
+      }
+      session.cancelled = false;
+      try {
+        const outcome = await this.drainTurn({ sessionId, session, owner: "pump" });
+        if (outcome.kind === "handed_off" || outcome.kind === "stream_ended") {
+          return;
+        }
+        // turn_ended: keep pumping for the next spontaneous turn.
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof Error && isProcessExitError(message)) {
+          this.logger.error(`Session ${sessionId}: Claude Agent process died: ${message}`);
+          if (this.sessions[sessionId] === session) {
+            session.settingsManager.dispose();
+            session.anyharness.tailer?.dispose();
+            session.input.end();
+            for (const [, pending] of session.pendingMessages) {
+              pending.resolve(true);
+            }
+            session.pendingMessages.clear();
+            delete this.sessions[sessionId];
+          }
+          return;
+        }
+        this.logger.error(`[anyharness] idle pump error for session ${sessionId}:`, error);
+        // Stop instead of spinning on a persistent error; a later prompt() or
+        // injected instruction restarts the pump.
+        return;
+      }
+    }
+  }
+
+  /**
+   * anyharness GoalPort/LoopPort extension methods (wire contract v1).
+   * Accepts both the `_anyharness/...` wire spelling (ACP requires ext
+   * methods to be `_`-prefixed on the wire) and the stripped
+   * `anyharness/...` spelling in case the transport strips the prefix
+   * before dispatch.
+   */
+  async extMethod(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const normalized = method.startsWith("_") ? method.slice(1) : method;
+    if (!normalized.startsWith("anyharness/")) {
+      throw RequestError.methodNotFound(method);
+    }
+    this.logger.log(`[anyharness] extMethod received on the wire as: ${method}`);
+
+    const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+    if (!sessionId) {
+      throw RequestError.invalidParams(undefined, "sessionId is required");
+    }
+    const session = this.sessions[sessionId];
+    if (!session) {
+      throw RequestError.resourceNotFound(sessionId);
+    }
+
+    switch (normalized) {
+      case "anyharness/goal/set":
+        return this.anyharnessGoalSet(sessionId, session, params);
+      case "anyharness/goal/get": {
+        const goal = session.anyharness.goal;
+        return { goal: goal ? goalWireFromState(goal) : null };
+      }
+      case "anyharness/goal/clear":
+        return this.anyharnessGoalClear(sessionId, session);
+      case "anyharness/loop/set":
+        return await this.anyharnessLoopSet(sessionId, session, params);
+      case "anyharness/loop/clear":
+        return await this.anyharnessLoopClear(sessionId, session, params);
+      case "anyharness/loop/list":
+        return { loops: activeLoops(session.anyharness).map(loopWireFromState) };
+      default:
+        throw RequestError.methodNotFound(method);
+    }
+  }
+
+  private anyharnessGoalSet(
+    sessionId: string,
+    session: Session,
+    params: Record<string, unknown>,
+  ): { goal: GoalWire } {
+    const ah = session.anyharness;
+    const objective = typeof params.objective === "string" ? params.objective.trim() : undefined;
+
+    if (objective === undefined || objective === "") {
+      // Status/budget-only patch (codex semantics). Claude has no native
+      // pause or token budget — return the current goal unchanged.
+      if (!ah.goal) {
+        throw RequestError.invalidParams(
+          undefined,
+          "objective is required (no goal is currently set)",
+        );
+      }
+      return { goal: goalWireFromState(ah.goal) };
+    }
+
+    this.ensureTranscriptTailer(sessionId, session);
+    // Native semantics: "/goal <condition>" arms the goal; re-sending replaces.
+    this.pushInjectedInstruction(sessionId, session, `/goal ${objective}`);
+
+    ah.goal = {
+      objective,
+      status: "active",
+      nativeStatus: "set",
+      metReason: null,
+      iterations: null,
+      tokensUsed: null,
+      timeUsedSeconds: null,
+      updatedAtMs: Date.now(),
+    };
+    ah.goalArmAnnounced = objective;
+    const wire = goalWireFromState(ah.goal);
+    void this.sendAnyharnessEvent(sessionId, "goal_updated", { goal: wire });
+    return { goal: wire };
+  }
+
+  private anyharnessGoalClear(sessionId: string, session: Session): { cleared: boolean } {
+    const ah = session.anyharness;
+    const hadActiveGoal = ah.goal !== null && ah.goal.status === "active";
+
+    this.pushInjectedInstruction(sessionId, session, "/goal clear");
+
+    if (ah.goal) {
+      ah.goal = {
+        ...ah.goal,
+        status: "cleared",
+        nativeStatus: "cleared",
+        updatedAtMs: Date.now(),
+      };
+    }
+    ah.goalArmAnnounced = null;
+    void this.sendAnyharnessEvent(sessionId, "goal_cleared", {});
+    return { cleared: hadActiveGoal };
+  }
+
+  private async anyharnessLoopSet(
+    sessionId: string,
+    session: Session,
+    params: Record<string, unknown>,
+  ): Promise<{ loop: LoopWire }> {
+    const ah = session.anyharness;
+    const prompt = typeof params.prompt === "string" ? params.prompt.trim() : "";
+    if (!prompt) {
+      throw RequestError.invalidParams(undefined, "prompt is required");
+    }
+    const schedule = params.schedule as LoopSchedule | undefined;
+    if (
+      !schedule ||
+      (schedule.kind !== "interval" && schedule.kind !== "cron") ||
+      typeof schedule.expr !== "string" ||
+      !schedule.expr.trim()
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'schedule { kind: "interval"|"cron", expr } is required',
+      );
+    }
+    const expr = schedule.expr.trim();
+    const recurring = params.recurring !== false;
+
+    // Both schedule kinds translate to "/loop <expr> <prompt>": interval
+    // expressions like "5m" directly, cron kind as the raw crontab string.
+    const created = new Promise<LoopState>((resolve) => {
+      ah.pendingLoopSets.push({
+        prompt,
+        schedule: { kind: schedule.kind, expr },
+        recurring,
+        requestedAtMs: Date.now(),
+        resolve,
+      });
+    });
+    this.pushInjectedInstruction(sessionId, session, `/loop ${expr} ${prompt}`);
+
+    // Wait for the CronCreate tool_use so the response carries the real
+    // native cron id; fall back to a provisional loop on timeout (the
+    // loop_updated notification remains the source of truth either way).
+    const observed = await Promise.race([created, sleep(LOOP_SET_TIMEOUT_MS).then(() => null)]);
+    if (observed) {
+      return { loop: loopWireFromState(observed) };
+    }
+
+    this.logger.error(
+      `[anyharness] loop/set: CronCreate not observed within ${LOOP_SET_TIMEOUT_MS}ms; returning provisional loop`,
+    );
+    const pendingIndex = ah.pendingLoopSets.findIndex((p) => p.prompt === prompt);
+    if (pendingIndex >= 0) {
+      ah.pendingLoopSets.splice(pendingIndex, 1);
+    }
+    const loop: LoopState = {
+      loopId: `provisional-${randomUUID().slice(0, 8)}`,
+      prompt,
+      schedule: { kind: schedule.kind, expr },
+      recurring,
+      status: "active",
+      lastFiredAtMs: null,
+      fireCount: 0,
+      updatedAtMs: Date.now(),
+    };
+    ah.loops.set(loop.loopId, loop);
+    void this.sendAnyharnessEvent(sessionId, "loop_updated", {
+      loop: loopWireFromState(loop),
+      loopId: loop.loopId,
+    });
+    return { loop: loopWireFromState(loop) };
+  }
+
+  private async anyharnessLoopClear(
+    sessionId: string,
+    session: Session,
+    params: Record<string, unknown>,
+  ): Promise<{ cleared: number }> {
+    const ah = session.anyharness;
+    const loopId = typeof params.loopId === "string" ? params.loopId : undefined;
+    const targets = activeLoops(ah).filter((loop) => !loopId || loop.loopId === loopId);
+    if (targets.length === 0) {
+      return { cleared: 0 };
+    }
+
+    const instruction = loopId
+      ? `Use the CronDelete tool to delete the cron job with id "${loopId}". Do nothing else and reply with only: done`
+      : "Use the CronList tool to list all cron jobs, then use the CronDelete tool to delete each one. Do nothing else and reply with only: done";
+    this.pushInjectedInstruction(sessionId, session, instruction);
+
+    // Wait (bounded) for CronDelete tool_use observations to confirm.
+    const confirmed = new Promise<void>((resolve) => {
+      const check = () => {
+        if (targets.every((loop) => loop.status === "cleared")) {
+          resolve();
+        }
+      };
+      check();
+      ah.loopClearWatchers.push(check);
+    });
+    await Promise.race([confirmed, sleep(LOOP_CLEAR_TIMEOUT_MS)]);
+
+    // Mark any unconfirmed targets cleared anyway (optimistic) so state and
+    // notifications stay consistent with the requested mutation.
+    for (const loop of targets) {
+      if (loop.status !== "cleared") {
+        this.logger.error(
+          `[anyharness] loop/clear: CronDelete for ${loop.loopId} not observed within ${LOOP_CLEAR_TIMEOUT_MS}ms; marking cleared optimistically`,
+        );
+        loop.status = "cleared";
+        loop.updatedAtMs = Date.now();
+        void this.sendAnyharnessEvent(sessionId, "loop_cleared", { loopId: loop.loopId });
+      }
+    }
+    return { cleared: targets.length };
+  }
+
+  /** Observes CronCreate/CronDelete/CronList executions (via PostToolUse hook). */
+  private async handleCronTool(
+    sessionId: string,
+    toolName: string,
+    toolInput: unknown,
+    toolResponse: unknown,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const ah = session.anyharness;
+    this.logger.log(
+      `[anyharness] observed ${toolName}: input=${safeJson(toolInput)} response=${safeJson(toolResponse)}`,
+    );
+
+    if (toolName === "CronCreate") {
+      const input = (toolInput ?? {}) as { cron?: unknown; prompt?: unknown; recurring?: unknown };
+      const promptText = typeof input.prompt === "string" ? input.prompt : "";
+      const loopId =
+        extractCronId(toolResponse) ??
+        extractCronId(toolInput) ??
+        `cron-${randomUUID().slice(0, 8)}`;
+
+      // Match the oldest pending loop/set (by prompt when possible).
+      let pendingIndex = ah.pendingLoopSets.findIndex((p) => p.prompt === promptText);
+      if (pendingIndex < 0 && ah.pendingLoopSets.length > 0) {
+        pendingIndex = 0;
+      }
+      const pending = pendingIndex >= 0 ? ah.pendingLoopSets.splice(pendingIndex, 1)[0] : undefined;
+
+      const loop: LoopState = {
+        loopId,
+        prompt: promptText || pending?.prompt || "",
+        schedule:
+          pending?.schedule ??
+          (typeof input.cron === "string"
+            ? { kind: "cron", expr: input.cron }
+            : { kind: "cron", expr: "" }),
+        recurring:
+          typeof input.recurring === "boolean" ? input.recurring : (pending?.recurring ?? true),
+        status: "active",
+        lastFiredAtMs: null,
+        fireCount: 0,
+        updatedAtMs: Date.now(),
+      };
+      ah.loops.set(loopId, loop);
+      pending?.resolve(loop);
+      await this.sendAnyharnessEvent(sessionId, "loop_updated", {
+        loop: loopWireFromState(loop),
+        loopId,
+      });
+      return;
+    }
+
+    if (toolName === "CronDelete") {
+      const deletedId = extractCronId(toolInput) ?? extractCronId(toolResponse);
+      const active = activeLoops(ah);
+      let target = deletedId ? ah.loops.get(deletedId) : undefined;
+      if (!target && active.length === 1) {
+        target = active[0];
+      }
+      if (!target) {
+        this.logger.error(
+          `[anyharness] CronDelete observed but no matching loop (id=${deletedId ?? "unknown"})`,
+        );
+        return;
+      }
+      if (target.status !== "cleared") {
+        target.status = "cleared";
+        target.updatedAtMs = Date.now();
+        await this.sendAnyharnessEvent(sessionId, "loop_cleared", { loopId: target.loopId });
+      }
+      for (const watcher of ah.loopClearWatchers) {
+        watcher();
+      }
+      return;
+    }
+    // CronList: observation only (logged above).
+  }
+
+  /**
+   * Pushes an instruction into the session as a user message the pump (or a
+   * running prompt drain) will process. The uuid is remembered so the drain
+   * loop can tell these turns apart from native cron wakes and keep their
+   * replays out of the client feed.
+   */
+  private pushInjectedInstruction(sessionId: string, session: Session, text: string): void {
+    const uuid = randomUUID();
+    session.anyharness.injectedUuids.add(uuid);
+    const message: SDKUserMessage = {
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text }] },
+      session_id: sessionId,
+      parent_tool_use_id: null,
+      uuid,
+    };
+    session.input.push(message);
+    // Ensure something drains the resulting turn when no prompt is active.
+    this.startIdlePump(sessionId);
+  }
+
+  /**
+   * Emits a zero-content agent_message_chunk tagged with
+   * _meta.anyharness.transcriptEvent (kept out of transcripts by anyharness
+   * via NON_TRANSCRIPT_CHUNK_EVENTS).
+   */
+  private async sendAnyharnessEvent(
+    sessionId: string,
+    transcriptEvent: AnyharnessTranscriptEvent,
+    payload: { goal?: GoalWire; loop?: LoopWire; loopId?: string },
+  ): Promise<void> {
+    try {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "" },
+          _meta: {
+            anyharness: {
+              schemaVersion: ANYHARNESS_SCHEMA_VERSION,
+              transcriptEvent,
+              ...payload,
+            },
+          },
+        },
+      });
+    } catch (error) {
+      this.logger.error(`[anyharness] failed to send ${transcriptEvent} notification:`, error);
+    }
+  }
+
+  /** Records the transcript path reported by hooks and (re)starts the tailer. */
+  private noteTranscriptPath(sessionId: string, transcriptPath: string): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      // Hooks can fire before createSession() registers the session.
+      this.pendingTranscriptPaths.set(sessionId, transcriptPath);
+      return;
+    }
+    const ah = session.anyharness;
+    if (ah.transcriptPath === transcriptPath && ah.tailer) {
+      return;
+    }
+    if (ah.tailer && ah.transcriptPath !== transcriptPath) {
+      ah.tailer.dispose();
+      ah.tailer = null;
+    }
+    ah.transcriptPath = transcriptPath;
+    this.ensureTranscriptTailer(sessionId, session);
+  }
+
+  /**
+   * Starts the transcript tailer that observes native goal_status attachments
+   * (goal arming sentinels, evaluations, met/failed transitions).
+   */
+  private ensureTranscriptTailer(sessionId: string, session: Session): void {
+    const ah = session.anyharness;
+    if (ah.tailer) {
+      return;
+    }
+    const transcriptPath =
+      ah.transcriptPath ??
+      this.pendingTranscriptPaths.get(sessionId) ??
+      computeTranscriptPath(CLAUDE_CONFIG_DIR, session.cwd, sessionId);
+    this.pendingTranscriptPaths.delete(sessionId);
+    ah.transcriptPath = transcriptPath;
+    const tailer = new TranscriptTailer(
+      transcriptPath,
+      (row) => this.handleTranscriptRow(sessionId, row),
+      this.logger,
+      { fromStart: ah.tailFromStart },
+    );
+    ah.tailer = tailer;
+    tailer.start();
+  }
+
+  private handleTranscriptRow(sessionId: string, row: unknown): void {
+    const goalStatus = extractGoalStatus(row);
+    if (!goalStatus) {
+      return;
+    }
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const ah = session.anyharness;
+    const now = Date.now();
+    const durationSeconds =
+      typeof goalStatus.durationMs === "number" ? goalStatus.durationMs / 1000 : null;
+    this.logger.log(`[anyharness] transcript goal_status row: ${safeJson(goalStatus)}`);
+
+    if (goalStatus.sentinel) {
+      // Arming marker (not an evaluation).
+      const objective = goalStatus.condition ?? ah.goal?.objective ?? "";
+      const alreadyAnnounced = ah.goalArmAnnounced === objective && ah.goal?.status === "active";
+      ah.goal = {
+        objective,
+        status: "active",
+        nativeStatus: "armed",
+        metReason: null,
+        iterations: goalStatus.iterations ?? ah.goal?.iterations ?? null,
+        tokensUsed: goalStatus.tokens ?? null,
+        timeUsedSeconds: durationSeconds,
+        updatedAtMs: now,
+      };
+      ah.goalArmAnnounced = objective;
+      if (!alreadyAnnounced) {
+        // Native-origin arm (e.g. the user typed /goal themselves).
+        void this.sendAnyharnessEvent(sessionId, "goal_updated", {
+          goal: goalWireFromState(ah.goal),
+        });
+      }
+      return;
+    }
+
+    const objective = goalStatus.condition ?? ah.goal?.objective ?? "";
+    if (goalStatus.met) {
+      ah.goal = {
+        objective,
+        status: "met",
+        nativeStatus: "met",
+        metReason: goalStatus.reason ?? null,
+        iterations: goalStatus.iterations ?? null,
+        tokensUsed: goalStatus.tokens ?? null,
+        timeUsedSeconds: durationSeconds,
+        updatedAtMs: now,
+      };
+      ah.goalArmAnnounced = null; // the native goal auto-clears once met
+      void this.sendAnyharnessEvent(sessionId, "goal_met", { goal: goalWireFromState(ah.goal) });
+      return;
+    }
+
+    if (goalStatus.failed) {
+      ah.goal = {
+        objective,
+        status: "failed",
+        nativeStatus: "failed",
+        metReason: goalStatus.reason ?? null,
+        iterations: goalStatus.iterations ?? null,
+        tokensUsed: goalStatus.tokens ?? null,
+        timeUsedSeconds: durationSeconds,
+        updatedAtMs: now,
+      };
+      void this.sendAnyharnessEvent(sessionId, "goal_updated", {
+        goal: goalWireFromState(ah.goal),
+      });
+      return;
+    }
+
+    // Evaluation that did not meet the goal — progress update.
+    ah.goal = {
+      objective,
+      status: "active",
+      nativeStatus: "not_met",
+      metReason: goalStatus.reason ?? null,
+      iterations: goalStatus.iterations ?? null,
+      tokensUsed: goalStatus.tokens ?? null,
+      timeUsedSeconds: durationSeconds,
+      updatedAtMs: now,
+    };
+    void this.sendAnyharnessEvent(sessionId, "goal_updated", {
+      goal: goalWireFromState(ah.goal),
+    });
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -2600,6 +3331,10 @@ export class ClaudeAcpAgent implements Agent {
                   });
                   await this.updateConfigOption(sessionId, "mode", "plan");
                 },
+                onTranscriptPath: (transcriptPath) =>
+                  this.noteTranscriptPath(sessionId, transcriptPath),
+                onCronTool: (toolName, toolInput, toolResponse) =>
+                  this.handleCronTool(sessionId, toolName, toolInput, toolResponse),
               }),
             ],
           },
@@ -2808,7 +3543,19 @@ export class ClaudeAcpAgent implements Agent {
       toolUseCache: {},
       messageIdToUuid: new Map(),
       fastModeEnabled: initialFastModeEnabled,
+      // Fresh sessions tail their transcript from the start; resumed/forked
+      // sessions only from EOF (their transcript already contains history).
+      anyharness: newAnyharnessSessionState(creationOpts.resume === undefined),
     };
+
+    // If a hook already reported the transcript path (SessionStart fires
+    // during initialization), start the goal tailer now. Otherwise it starts
+    // when the path is first reported or when a goal is set.
+    if (this.pendingTranscriptPaths.has(sessionId)) {
+      this.ensureTranscriptTailer(sessionId, this.sessions[sessionId]);
+    }
+    // Drain idle-time SDK messages (injected instructions, cron wake turns).
+    this.startIdlePump(sessionId);
 
     return {
       sessionId,
