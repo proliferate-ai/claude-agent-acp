@@ -79,6 +79,7 @@ import {
   GoalStatusRow,
   GoalWire,
   goalWireFromState,
+  isSyntheticLoopId,
   LoopSchedule,
   LoopState,
   LoopWire,
@@ -397,6 +398,28 @@ function pendingGoalWire(objective: string): GoalWire {
     metReason: null,
     iterations: null,
     native: true,
+    updatedAtMs: Date.now(),
+  };
+}
+
+/**
+ * A provisional LoopWire returned from loop/set while the "/loop" injection is
+ * deferred behind a streaming turn (mirrors pendingGoalWire). It carries a
+ * synthetic "provisional-" id and status "active"; the mirror is left untouched
+ * and the authoritative loop — with its real cron id — arrives later as a
+ * loop_upserted notification when the deferred "/loop" runs and its CronCreate
+ * is observed. The notification, not this response, is the source of truth.
+ */
+function pendingLoopWire(prompt: string, schedule: LoopSchedule, recurring: boolean): LoopWire {
+  return {
+    loopId: `provisional-${randomUUID().slice(0, 8)}`,
+    prompt,
+    schedule,
+    recurring,
+    status: "active",
+    native: true,
+    lastFiredAtMs: null,
+    fireCount: 0,
     updatedAtMs: Date.now(),
   };
 }
@@ -1611,8 +1634,32 @@ export class ClaudeAcpAgent implements Agent {
     const expr = schedule.expr.trim();
     const recurring = params.recurring !== false;
 
-    // Both schedule kinds translate to "/loop <expr> <prompt>": interval
-    // expressions like "5m" directly, cron kind as the raw crontab string.
+    if (!this.canInjectNow(session)) {
+      // Deferral fix (mirrors goal/set): a turn is streaming, so "/loop" sent
+      // now would degrade to a never-executing queued prompt. Blocking on the
+      // 60s CronCreate race here — while the /loop injection is still deferred
+      // behind the turn — guarantees a timeout on any turn longer than 60s,
+      // which minted a phantom "provisional-" loop AND (when the deferred /loop
+      // finally ran) a second real-id loop for the same cron. Instead: register
+      // the pending set so the deferred /loop's CronCreate attributes to this
+      // request by prompt, enqueue, and return a provisional loop immediately.
+      // The mirror stays untouched (no optimistic state) until the loop_upserted
+      // notification lands — that notification is the source of truth.
+      ah.pendingLoopSets.push({
+        prompt,
+        schedule: { kind: schedule.kind, expr },
+        recurring,
+        requestedAtMs: Date.now(),
+        resolve: () => {},
+      });
+      this.enqueueInjectedInstruction(sessionId, session, `/loop ${expr} ${prompt}`);
+      return { loop: pendingLoopWire(prompt, { kind: schedule.kind, expr }, recurring) };
+    }
+
+    // Idle path: "/loop" injects synchronously, so racing the CronCreate here is
+    // bounded by real execution time. Both schedule kinds translate to
+    // "/loop <expr> <prompt>": interval expressions like "5m" directly, cron
+    // kind as the raw crontab string.
     const created = new Promise<LoopState>((resolve) => {
       ah.pendingLoopSets.push({
         prompt,
@@ -1626,7 +1673,8 @@ export class ClaudeAcpAgent implements Agent {
 
     // Wait for the CronCreate tool_use so the response carries the real
     // native cron id; fall back to a provisional loop on timeout (the
-    // loop_upserted notification remains the source of truth either way).
+    // loop_upserted notification remains the source of truth either way, and
+    // handleCronTool collapses the placeholder when the real CronCreate lands).
     const observed = await Promise.race([created, sleep(LOOP_SET_TIMEOUT_MS).then(() => null)]);
     if (observed) {
       return { loop: loopWireFromState(observed) };
@@ -1751,12 +1799,38 @@ export class ClaudeAcpAgent implements Agent {
         fireCount: 0,
         updatedAtMs: Date.now(),
       };
+
+      // Collapse any synthetic placeholder loop for the same prompt into this
+      // real cron. A loop/set that fell back to a "provisional-" loop (its
+      // CronCreate not observed before the idle-path RPC timeout) is THIS cron
+      // under a placeholder id — carry its fire bookkeeping forward and drop it,
+      // so one cron never shows as two loops. reconcileSessionCrons can't heal
+      // this once a real-id loop exists (its synthetic-upgrade branch is skipped
+      // and its removal sweep spares synthetic ids), so it must be collapsed here.
+      const placeholders =
+        loop.prompt.length > 0
+          ? activeLoops(ah).filter(
+              (other) =>
+                other.loopId !== loopId &&
+                isSyntheticLoopId(other.loopId) &&
+                other.prompt === loop.prompt,
+            )
+          : [];
+      for (const placeholder of placeholders) {
+        loop.fireCount = Math.max(loop.fireCount, placeholder.fireCount);
+        loop.lastFiredAtMs = loop.lastFiredAtMs ?? placeholder.lastFiredAtMs;
+        ah.loops.delete(placeholder.loopId);
+      }
+
       ah.loops.set(loopId, loop);
       pending?.resolve(loop);
       await this.sendAnyharnessEvent(sessionId, "loop_upserted", {
         loop: loopWireFromState(loop),
         loopId,
       });
+      for (const placeholder of placeholders) {
+        await this.sendAnyharnessEvent(sessionId, "loop_removed", { loopId: placeholder.loopId });
+      }
       return;
     }
 

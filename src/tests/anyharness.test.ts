@@ -1325,4 +1325,93 @@ describe("extMethod dispatch", () => {
       expect(session.anyharness.deferredInjections).toHaveLength(0);
     });
   });
+
+  describe("loop/set deferral behind a streaming turn", () => {
+    it("defers a mid-turn loop/set and returns a provisional loop without minting a duplicate", async () => {
+      const { agent } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      // A turn is streaming — a `/loop` now would degrade to a queued command,
+      // and (before the fix) the 60s CronCreate race would time out and mint a
+      // phantom loop that the later real CronCreate would duplicate.
+      session.promptRunning = true;
+      const push = vi.spyOn(session.input, "push");
+
+      // Resolves immediately (no 60s block) with a provisional loop.
+      const result = (await agent.extMethod("_anyharness/loop/set", {
+        sessionId: "s1",
+        prompt: "append ping to PING.log",
+        schedule: { kind: "interval", expr: "1m" },
+      })) as { loop: { loopId: string; prompt: string; status: string; native: boolean } };
+      expect(result.loop).toMatchObject({
+        prompt: "append ping to PING.log",
+        status: "active",
+        native: true,
+      });
+      expect(isSyntheticLoopId(result.loop.loopId)).toBe(true);
+
+      // Nothing injected yet; the mirror is untouched (no optimistic loop), but a
+      // pending set is registered so the deferred /loop's CronCreate attributes here.
+      expect(push).not.toHaveBeenCalled();
+      expect(session.anyharness.loops.size).toBe(0);
+      expect(session.anyharness.deferredInjections).toHaveLength(1);
+      expect(session.anyharness.pendingLoopSets).toHaveLength(1);
+
+      // The turn ends → flush injects the deferred /loop at the boundary.
+      session.promptRunning = false;
+      session.anyharness.turnActive = false;
+      call(agent, "tryFlushDeferredInjections", "s1");
+      expect(push).toHaveBeenCalledOnce();
+      expect(push.mock.calls[0][0].message.content).toEqual([
+        { type: "text", text: "/loop 1m append ping to PING.log" },
+      ]);
+
+      // The /loop runs and its CronCreate is observed — one real loop, no duplicate.
+      await call(
+        agent,
+        "handleCronTool",
+        "s1",
+        "CronCreate",
+        { cron: "*/1 * * * *", prompt: "append ping to PING.log", recurring: true },
+        "Scheduled recurring job realjob42 (Every minute). Session-only. Use CronDelete to cancel.",
+      );
+      expect([...session.anyharness.loops.keys()]).toEqual(["realjob42"]);
+      expect(session.anyharness.pendingLoopSets).toHaveLength(0);
+    });
+
+    it("collapses an idle-path provisional loop into the real cron when its CronCreate lands late", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      // Simulate the idle-path RPC timeout: a "provisional-" loop is already in
+      // the mirror (with accrued fire bookkeeping) and its pending set is gone.
+      session.anyharness.loops.set(
+        "provisional-abc",
+        activeLoop({
+          loopId: "provisional-abc",
+          prompt: "append ping to PING.log",
+          fireCount: 2,
+          lastFiredAtMs: 111,
+        }),
+      );
+
+      await call(
+        agent,
+        "handleCronTool",
+        "s1",
+        "CronCreate",
+        { cron: "*/1 * * * *", prompt: "append ping to PING.log", recurring: true },
+        "Scheduled recurring job realjob99 (Every minute). Session-only. Use CronDelete to cancel.",
+      );
+
+      // Exactly one loop — the real id — carrying the placeholder's fire count.
+      expect([...session.anyharness.loops.keys()]).toEqual(["realjob99"]);
+      const real = session.anyharness.loops.get("realjob99")!;
+      expect(real.fireCount).toBe(2);
+      expect(real.lastFiredAtMs).toBe(111);
+      // The client is told to add the real loop and drop the placeholder.
+      const events = anyharnessEvents(updates);
+      expect(events.map((e) => e.transcriptEvent)).toEqual(["loop_upserted", "loop_removed"]);
+      expect(events[0].loop?.loopId).toBe("realjob99");
+      expect(events[1].loopId).toBe("provisional-abc");
+    });
+  });
 });
