@@ -2042,6 +2042,13 @@ export class ClaudeAcpAgent implements Agent {
       case "anyharness/goal/set":
         return await this.anyharnessGoalSet(sessionId, session, params);
       case "anyharness/goal/get": {
+        // Ensure the tailer's synchronous seed has run before answering. On a
+        // resumed/forked session a native goal survives --resume but the
+        // mirror starts null; without the seed, an attach-time reconcile that
+        // races the CLI's SessionStart hook would read null and clear a goal
+        // that is still active natively. ensureTranscriptTailer is idempotent
+        // and runs readLastGoalStatus() to seed ah.goal for resume/fork.
+        this.ensureTranscriptTailer(sessionId, session);
         const goal = session.anyharness.goal;
         return { goal: goal ? goalWireFromState(goal) : null };
       }
