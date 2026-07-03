@@ -764,8 +764,19 @@ export class ClaudeAcpAgent implements Agent {
     // - "wake": a spontaneous native cron wake turn (emits loop_fired)
     // - "plain": spontaneous activity with no loop armed
     let turnKind: "unknown" | "injected" | "wake" | "plain" = "unknown";
+    // Whether the drain has reached the turn it is responsible for reporting.
+    // A prompt() drain normally owns the stream from the start, but one handed
+    // the stream by an interrupted idle pump (pendingQueryNext still holds the
+    // pump's in-flight next()) can receive spontaneous cron-wake / injected
+    // "pre-turns" first. Those pre-turns must be classified (loop_fired) and
+    // streamed exactly as the pump would, and must NOT end the prompt() call or
+    // count toward its usage — the prompt's own queued message replay is still
+    // ahead. Local-only commands never replay a user message, so they own the
+    // stream immediately. The idle pump never "owns" a turn in this sense.
+    let inOwnTurn =
+      params.owner !== "prompt" ? false : isLocalOnlyCommand || !session.pendingQueryNext;
     const markSpontaneousTurn = async (userText?: string) => {
-      if (params.owner !== "pump" || turnKind !== "unknown") {
+      if (inOwnTurn || turnKind !== "unknown") {
         return;
       }
       const loops = activeLoops(session.anyharness);
@@ -857,7 +868,9 @@ export class ClaudeAcpAgent implements Agent {
           if (systemMessage.subtype === "init") {
             // Cron wakes re-emit system:init at the start of the spontaneous
             // turn — reset classification so each wake is evaluated fresh.
-            if (params.owner === "pump") {
+            // A prompt draining pre-turns (handed off from an interrupted idle
+            // pump) resets the same way until it reaches its own turn.
+            if (!inOwnTurn) {
               turnKind = "unknown";
             }
             break;
@@ -899,7 +912,16 @@ export class ClaudeAcpAgent implements Agent {
           }
           if (isLegacySessionStateChangedMessage(systemMessage)) {
             if (systemMessage.state === "idle") {
-              return { kind: "turn_ended", stopReason };
+              if (params.owner === "pump" || inOwnTurn) {
+                return { kind: "turn_ended", stopReason };
+              }
+              // A prompt() drain still working through spontaneous pre-turns
+              // (handed off from an interrupted idle pump) must not end on a
+              // pre-turn's idle boundary — its own queued message replay is
+              // still ahead. Reset classification and keep draining.
+              turnKind = "unknown";
+              stopReason = "end_turn";
+              break;
             }
             break;
           }
@@ -1044,6 +1066,10 @@ export class ClaudeAcpAgent implements Agent {
           // Check for prompt replay
           if (message.type === "user" && "uuid" in message && message.uuid) {
             if (message.uuid === promptUuid) {
+              // This prompt's own message replay — from here the drain owns
+              // the turn (stop classifying pre-turns and stop deferring the
+              // turn_ended / usage boundary to a later replay).
+              inOwnTurn = true;
               break;
             }
 
@@ -1063,8 +1089,10 @@ export class ClaudeAcpAgent implements Agent {
               turnKind = "injected";
               break;
             }
-            if (params.owner === "pump" && turnKind === "unknown") {
+            if (!inOwnTurn && turnKind === "unknown") {
               // A spontaneous user message may be a native cron wake prompt.
+              // This also covers a prompt drain working through a pre-turn it
+              // was handed by an interrupted idle pump.
               await markSpontaneousTurn(userMessageText(message.message.content));
             }
             if ("isReplay" in message && message.isReplay) {
