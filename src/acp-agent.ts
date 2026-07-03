@@ -1167,6 +1167,15 @@ export class ClaudeAcpAgent implements Agent {
     // - "wake": a spontaneous native cron wake turn (emits loop_fired)
     // - "plain": spontaneous activity with no loop armed
     let turnKind: "unknown" | "injected" | "wake" | "plain" = "unknown";
+    // True once a genuine spontaneous pre-turn — a native cron wake or an
+    // injected goal/loop instruction — has been classified ahead of the
+    // prompt's own message replay. Tracked as a plain boolean (rather than
+    // reading turnKind at the idle boundary) because "wake"/"plain" are only
+    // ever assigned inside the markSpontaneousTurn closure, so TS control-flow
+    // narrowing treats a direct `turnKind === "wake"` comparison as dead. A
+    // handed-off prompt drain only defers past an idle boundary when this is
+    // set; otherwise the handed-off stream was the prompt's own turn.
+    let sawSpontaneousPreTurn = false;
     // Whether the drain has reached the turn it is responsible for reporting.
     // A prompt() drain normally owns the stream from the start, but one handed
     // the stream by an interrupted idle pump (pendingQueryNext still holds the
@@ -1204,6 +1213,7 @@ export class ClaudeAcpAgent implements Agent {
         }
       }
       turnKind = "wake";
+      sawSpontaneousPreTurn = true;
       const now = Date.now();
       loop.fireCount += 1;
       loop.lastFiredAtMs = now;
@@ -1381,19 +1391,39 @@ export class ClaudeAcpAgent implements Agent {
             }
             case "session_state_changed": {
               if (message.state === "idle") {
+                // The CLI acknowledged an interrupt: cancel() set
+                // session.cancelled and called query.interrupt(), and the native
+                // process recorded "[Request interrupted by user]". No own-message
+                // replay ever follows an interrupt, and once cancelled the
+                // user/assistant branch short-circuits before the promptUuid match
+                // so inOwnTurn can never flip. ANY drain — including a prompt still
+                // working through handed-off pre-turns — must therefore end here,
+                // or the next next() blocks forever and prompt() hangs (the 135s
+                // wedge). This is the guarantee that every interrupt resolves
+                // prompt() as cancelled.
                 if (session.cancelled) {
-                  stopReason = "cancelled";
+                  return { kind: "turn_ended", stopReason: "cancelled" };
                 }
                 if (params.owner === "pump" || inOwnTurn) {
                   return { kind: "turn_ended", stopReason };
                 }
-                // A prompt() drain still working through spontaneous pre-turns
-                // (handed off from an interrupted idle pump) must not end on a
-                // pre-turn's idle boundary — its own queued message replay is
-                // still ahead. Reset classification and keep draining.
-                turnKind = "unknown";
-                stopReason = "end_turn";
-                break;
+                // A prompt() drain that doesn't yet own its turn was handed an
+                // in-flight next() by an interrupted idle pump. Defer past this
+                // idle boundary ONLY when a genuine spontaneous pre-turn (a native
+                // cron wake or an injected goal/loop instruction) is what just
+                // ended — then the prompt's own message replay is still queued
+                // behind it, so reset classification and keep draining. When
+                // nothing spontaneous was classified, the handed-off stream WAS
+                // the prompt's own turn (the common no-cron-wake case — a normal
+                // prompt while the idle pump was running), so end here instead of
+                // hanging forever waiting for a replay that will never come.
+                if (sawSpontaneousPreTurn) {
+                  turnKind = "unknown";
+                  sawSpontaneousPreTurn = false;
+                  stopReason = "end_turn";
+                  break;
+                }
+                return { kind: "turn_ended", stopReason };
               }
               break;
             }
@@ -1812,6 +1842,7 @@ export class ClaudeAcpAgent implements Agent {
               // wake, and not content the client should see.
               session.anyharness.injectedUuids.delete(message.uuid as string);
               turnKind = "injected";
+              sawSpontaneousPreTurn = true;
               break;
             }
             if (!inOwnTurn && turnKind === "unknown") {
