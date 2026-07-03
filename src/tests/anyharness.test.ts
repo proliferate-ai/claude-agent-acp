@@ -189,6 +189,35 @@ describe("extMethod dispatch", () => {
     });
   });
 
+  it("goal/get seeds the mirror from the transcript on a resumed session", async () => {
+    const { agent } = createAgent();
+    const transcriptPath = tempTranscript();
+    // A native goal that survived --resume: the transcript already holds the
+    // arm sentinel, but the fresh Session starts with an empty mirror.
+    fs.writeFileSync(
+      transcriptPath,
+      goalStatusLine({ met: false, sentinel: true, condition: "DONE.txt exists" }),
+    );
+    const session = injectSession(agent, "s1", transcriptPath);
+    // Resumed/forked sessions tail from EOF, so goal/get must trigger the
+    // synchronous seed itself (an attach reconcile pulls before the CLI's
+    // SessionStart hook seeds via the async pump).
+    session.anyharness.tailFromStart = false;
+    expect(session.anyharness.goal).toBeNull();
+
+    const result = (await agent.extMethod("_anyharness/goal/get", { sessionId: "s1" })) as {
+      goal: { objective: string; status: string; nativeStatus: string } | null;
+    };
+    expect(result.goal).toMatchObject({
+      objective: "DONE.txt exists",
+      status: "active",
+      nativeStatus: "armed",
+    });
+    // The seeded mirror is non-terminal, so an attach reconcile sees the goal
+    // instead of clearing it.
+    expect(session.anyharness.goal?.status).toBe("active");
+  });
+
   it("rejects unknown methods, missing sessionId, and unknown sessions", async () => {
     const { agent } = createAgent();
     injectSession(agent, "s1");
