@@ -778,12 +778,20 @@ export const createPostToolUseHook =
       onTranscriptPath?: (transcriptPath: string) => void;
       /* Observes native cron tool executions (CronCreate/CronDelete/CronList). */
       onCronTool?: (toolName: string, toolInput: unknown, toolResponse: unknown) => Promise<void>;
+      /* Reports the session_crons snapshot carried on every hook input (loop reconcile). */
+      onSessionCrons?: (crons: unknown) => Promise<void>;
     },
   ): HookCallback =>
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PostToolUse") {
       if (typeof input.transcript_path === "string" && options?.onTranscriptPath) {
         options.onTranscriptPath(input.transcript_path);
+      }
+
+      // Every hook payload carries a fresh session_crons snapshot — a free,
+      // authoritative reconciliation source for the loop mirror.
+      if (input.session_crons !== undefined && options?.onSessionCrons) {
+        await options.onSessionCrons(input.session_crons);
       }
 
       // Handle EnterPlanMode tool - notify client of mode change after successful execution

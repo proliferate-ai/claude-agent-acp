@@ -74,6 +74,7 @@ import {
   AnyharnessTranscriptEvent,
   classifyGoalStatus,
   computeTranscriptPath,
+  extractCronId,
   extractGoalStatus,
   GoalStatusRow,
   GoalWire,
@@ -83,7 +84,16 @@ import {
   LoopWire,
   loopWireFromState,
   newAnyharnessSessionState,
+  parseBackgroundOutputFile,
+  parseCronIdFromResult,
+  ProcessState,
+  ProcessWire,
+  processWireFromState,
   readLastGoalStatus,
+  reconcileSessionCrons,
+  subagentFeedPath,
+  SubagentState,
+  SubagentWire,
   TranscriptTailer,
 } from "./anyharness.js";
 import { SettingsManager } from "./settings.js";
@@ -342,6 +352,54 @@ function safeJson(value: unknown): string {
   }
 }
 
+/** Best-effort extraction of a crons array from a CronList tool response. */
+function extractCronArray(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of [
+    "crons",
+    "jobs",
+    "session_crons",
+    "sessionCrons",
+    "result",
+    "output",
+    "structuredContent",
+    "content",
+  ]) {
+    const found = extractCronArray(record[key]);
+    if (found) {
+      return found;
+    }
+  }
+  return null;
+}
+
+/**
+ * A provisional GoalWire returned from goal/set while the "/goal" injection is
+ * deferred behind a streaming turn. nativeStatus "pending_injection" flags the
+ * queued (not-yet-armed) state; the mirror is untouched and the truthful
+ * transition arrives later as a goal_updated notification.
+ */
+function pendingGoalWire(objective: string): GoalWire {
+  return {
+    objective,
+    status: "active",
+    nativeStatus: "pending_injection",
+    tokenBudget: null,
+    tokensUsed: null,
+    timeUsedSeconds: null,
+    metReason: null,
+    iterations: null,
+    native: true,
+    updatedAtMs: Date.now(),
+  };
+}
+
 /** Extracts the text of a plain user message (used to attribute cron wakes). */
 function userMessageText(content: unknown): string | undefined {
   if (typeof content === "string") {
@@ -359,30 +417,6 @@ function userMessageText(content: unknown): string | undefined {
       .map((block) => block.text);
     if (texts.length > 0) {
       return texts.join("\n");
-    }
-  }
-  return undefined;
-}
-
-/** Best-effort extraction of the cron job id from CronCreate/CronDelete tool IO. */
-function extractCronId(value: unknown): string | undefined {
-  if (typeof value !== "object" || value === null) {
-    return undefined;
-  }
-  const record = value as Record<string, unknown>;
-  for (const key of ["id", "jobId", "cronId", "job_id", "cron_id"]) {
-    const candidate = record[key];
-    if (typeof candidate === "string" && candidate) {
-      return candidate;
-    }
-    if (typeof candidate === "number") {
-      return String(candidate);
-    }
-  }
-  for (const key of ["job", "cron", "result", "output", "structuredContent"]) {
-    const found = extractCronId(record[key]);
-    if (found) {
-      return found;
     }
   }
   return undefined;
@@ -709,10 +743,15 @@ export class ClaudeAcpAgent implements Agent {
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
+        session.anyharness.turnActive = false;
         // This usually should not happen, but in case the loop finishes
         // without claude sending all message replays, we resolve the
         // next pending prompt call to ensure no prompts get stuck.
         this.resolveNextPendingPrompt(session);
+        // The session is idle again — flush any goal/loop injection deferred
+        // behind this prompt's turn (unless resolveNextPendingPrompt just handed
+        // off to another queued prompt, in which case the flush no-ops).
+        this.tryFlushDeferredInjections(params.sessionId);
         // Resume the idle background pump so injected goal/loop instructions
         // and spontaneous cron wake turns keep draining between prompts.
         this.startIdlePump(params.sessionId);
@@ -873,6 +912,10 @@ export class ClaudeAcpAgent implements Agent {
         return { kind: "stream_ended" };
       }
       messagesSeen += 1;
+      // A message is being processed → a turn is active. Deferred goal/loop
+      // injections wait for this to fall (at a turn boundary) so a `/goal`
+      // local command can't degrade into a queued mid-turn prompt.
+      session.anyharness.turnActive = true;
 
       switch (message.type) {
         case "system": {
@@ -965,13 +1008,21 @@ export class ClaudeAcpAgent implements Agent {
             break;
           }
           if (
+            systemMessage.subtype === "task_started" ||
+            systemMessage.subtype === "task_notification" ||
+            systemMessage.subtype === "task_progress"
+          ) {
+            // Read-only activity roster: normalize the Claude task machinery
+            // (background bash + subagents) into process_upserted /
+            // subagent_upserted records. Best-effort — never fail the drain.
+            void this.handleTaskEvent(params.sessionId, systemMessage);
+            break;
+          }
+          if (
             systemMessage.subtype === "hook_started" ||
             systemMessage.subtype === "hook_progress" ||
             systemMessage.subtype === "hook_response" ||
             systemMessage.subtype === "files_persisted" ||
-            systemMessage.subtype === "task_started" ||
-            systemMessage.subtype === "task_notification" ||
-            systemMessage.subtype === "task_progress" ||
             systemMessage.subtype === "elicitation_complete" ||
             isLegacyApiRetryMessage(systemMessage)
           ) {
@@ -1098,6 +1149,10 @@ export class ClaudeAcpAgent implements Agent {
         }
         case "user":
         case "assistant": {
+          // Capture background-bash command / output-file for the activity
+          // roster before any early-out below (runs regardless of cancellation).
+          this.captureTaskIo(params.sessionId, message);
+
           if (session.cancelled) {
             break;
           }
@@ -1274,6 +1329,10 @@ export class ClaudeAcpAgent implements Agent {
       session.cancelled = false;
       try {
         const outcome = await this.drainTurn({ sessionId, session, owner: "pump" });
+        // The pump is idle again between spontaneous turns — flush any goal/loop
+        // injection deferred behind the turn that just ended.
+        session.anyharness.turnActive = false;
+        this.tryFlushDeferredInjections(sessionId);
         if (outcome.kind === "handed_off" || outcome.kind === "stream_ended") {
           return;
         }
@@ -1350,6 +1409,19 @@ export class ClaudeAcpAgent implements Agent {
         return await this.anyharnessLoopClear(sessionId, session, params);
       case "anyharness/loop/list":
         return { loops: activeLoops(session.anyharness).map(loopWireFromState) };
+      case "anyharness/activity/list": {
+        // The reconcile pull (attach/resume): the whole SessionActivity mirror —
+        // goal + loops + read-only rosters — served from the adapter's tracked
+        // state, so a reattaching runtime heals without replaying the stream.
+        this.ensureTranscriptTailer(sessionId, session);
+        const ah = session.anyharness;
+        return {
+          goal: ah.goal ? goalWireFromState(ah.goal) : null,
+          loops: activeLoops(ah).map(loopWireFromState),
+          processes: [...ah.processes.values()].map(processWireFromState),
+          subagents: [...ah.subagents.values()],
+        };
+      }
       default:
         throw RequestError.methodNotFound(method);
     }
@@ -1431,15 +1503,29 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     this.ensureTranscriptTailer(sessionId, session);
-    // Native semantics: "/goal <condition>" arms the goal; re-sending
-    // replaces. The mirror transitions only once the native arm sentinel
-    // round-trips through the transcript — no optimistic saved-state.
+
+    if (!this.canInjectNow(session)) {
+      // Deferral fix: a turn is streaming, so a `/goal` sent now would degrade
+      // to a never-executing queued prompt (the 30s-timeout 409). Hold it until
+      // the turn boundary. The arm sentinel that fires after injection drives
+      // the real goal_updated notification via handleTranscriptRow (the mirror
+      // stays untouched until then — no optimistic state). Return a provisional
+      // pending goal; anyharness treats ext-method responses as
+      // optimistic-pending only and reconciles from the notification.
+      this.enqueueInjectedInstruction(sessionId, session, `/goal ${objective}`);
+      return { goal: pendingGoalWire(objective) };
+    }
+
+    // Idle path: "/goal <condition>" arms the goal; re-sending replaces. The
+    // mirror transitions only once the native arm sentinel round-trips through
+    // the transcript — no optimistic saved-state. The confirmation clock starts
+    // at injection (which, while idle, happens synchronously below).
     const confirmed = this.waitForGoalRow(
       session,
       (row) => classifyGoalStatus(row) === "armed" && (row.condition ?? "").trim() === objective,
       GOAL_SET_TIMEOUT_MS,
     );
-    this.pushInjectedInstruction(sessionId, session, `/goal ${objective}`);
+    this.enqueueInjectedInstruction(sessionId, session, `/goal ${objective}`);
 
     const row = await confirmed;
     if (!row || !ah.goal) {
@@ -1460,6 +1546,16 @@ export class ClaudeAcpAgent implements Agent {
     const hadActiveGoal = ah.goal !== null && ah.goal.status === "active";
 
     this.ensureTranscriptTailer(sessionId, session);
+
+    if (!this.canInjectNow(session)) {
+      // Deferral fix (as goal/set): hold "/goal clear" until the turn boundary
+      // rather than degrading it mid-turn. The clear sentinel fired after
+      // injection drives the goal_cleared notification via handleTranscriptRow;
+      // the ext response is provisional.
+      this.enqueueInjectedInstruction(sessionId, session, "/goal clear");
+      return { cleared: hadActiveGoal };
+    }
+
     const confirmed = this.waitForGoalRow(
       session,
       (row) => classifyGoalStatus(row) === "cleared",
@@ -1468,7 +1564,7 @@ export class ClaudeAcpAgent implements Agent {
     // Always send the native clear so mirror drift heals; with no native
     // goal armed it is a zero-token no-op ("No goal set") that writes no
     // transcript row, so only wait for confirmation when one is expected.
-    this.pushInjectedInstruction(sessionId, session, "/goal clear");
+    this.enqueueInjectedInstruction(sessionId, session, "/goal clear");
     if (!hadActiveGoal) {
       return { cleared: false };
     }
@@ -1520,11 +1616,11 @@ export class ClaudeAcpAgent implements Agent {
         resolve,
       });
     });
-    this.pushInjectedInstruction(sessionId, session, `/loop ${expr} ${prompt}`);
+    this.enqueueInjectedInstruction(sessionId, session, `/loop ${expr} ${prompt}`);
 
     // Wait for the CronCreate tool_use so the response carries the real
     // native cron id; fall back to a provisional loop on timeout (the
-    // loop_updated notification remains the source of truth either way).
+    // loop_upserted notification remains the source of truth either way).
     const observed = await Promise.race([created, sleep(LOOP_SET_TIMEOUT_MS).then(() => null)]);
     if (observed) {
       return { loop: loopWireFromState(observed) };
@@ -1548,7 +1644,7 @@ export class ClaudeAcpAgent implements Agent {
       updatedAtMs: Date.now(),
     };
     ah.loops.set(loop.loopId, loop);
-    void this.sendAnyharnessEvent(sessionId, "loop_updated", {
+    void this.sendAnyharnessEvent(sessionId, "loop_upserted", {
       loop: loopWireFromState(loop),
       loopId: loop.loopId,
     });
@@ -1570,7 +1666,7 @@ export class ClaudeAcpAgent implements Agent {
     const instruction = loopId
       ? `Use the CronDelete tool to delete the cron job with id "${loopId}". Do nothing else and reply with only: done`
       : "Use the CronList tool to list all cron jobs, then use the CronDelete tool to delete each one. Do nothing else and reply with only: done";
-    this.pushInjectedInstruction(sessionId, session, instruction);
+    this.enqueueInjectedInstruction(sessionId, session, instruction);
 
     // Wait (bounded) for CronDelete tool_use observations to confirm.
     const confirmed = new Promise<void>((resolve) => {
@@ -1593,7 +1689,7 @@ export class ClaudeAcpAgent implements Agent {
         );
         loop.status = "cleared";
         loop.updatedAtMs = Date.now();
-        void this.sendAnyharnessEvent(sessionId, "loop_cleared", { loopId: loop.loopId });
+        void this.sendAnyharnessEvent(sessionId, "loop_removed", { loopId: loop.loopId });
       }
     }
     return { cleared: targets.length };
@@ -1618,7 +1714,11 @@ export class ClaudeAcpAgent implements Agent {
     if (toolName === "CronCreate") {
       const input = (toolInput ?? {}) as { cron?: unknown; prompt?: unknown; recurring?: unknown };
       const promptText = typeof input.prompt === "string" ? input.prompt : "";
+      // Live-verified: CronCreate returns a prose result ("Scheduled recurring
+      // job <id> …") — the real id is only in the string, so parse it first
+      // before the structured/synthesized fallbacks.
       const loopId =
+        parseCronIdFromResult(toolResponse) ??
         extractCronId(toolResponse) ??
         extractCronId(toolInput) ??
         `cron-${randomUUID().slice(0, 8)}`;
@@ -1647,7 +1747,7 @@ export class ClaudeAcpAgent implements Agent {
       };
       ah.loops.set(loopId, loop);
       pending?.resolve(loop);
-      await this.sendAnyharnessEvent(sessionId, "loop_updated", {
+      await this.sendAnyharnessEvent(sessionId, "loop_upserted", {
         loop: loopWireFromState(loop),
         loopId,
       });
@@ -1655,7 +1755,10 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     if (toolName === "CronDelete") {
-      const deletedId = extractCronId(toolInput) ?? extractCronId(toolResponse);
+      const deletedId =
+        extractCronId(toolInput) ??
+        extractCronId(toolResponse) ??
+        parseCronIdFromResult(toolResponse);
       const active = activeLoops(ah);
       let target = deletedId ? ah.loops.get(deletedId) : undefined;
       if (!target && active.length === 1) {
@@ -1670,33 +1773,326 @@ export class ClaudeAcpAgent implements Agent {
       if (target.status !== "cleared") {
         target.status = "cleared";
         target.updatedAtMs = Date.now();
-        await this.sendAnyharnessEvent(sessionId, "loop_cleared", { loopId: target.loopId });
+        await this.sendAnyharnessEvent(sessionId, "loop_removed", { loopId: target.loopId });
       }
       for (const watcher of ah.loopClearWatchers) {
         watcher();
       }
       return;
     }
-    // CronList: observation only (logged above).
+
+    if (toolName === "CronList") {
+      // A CronList result is itself an authoritative snapshot of the armed
+      // crons — reconcile the mirror against it, same as a hook's session_crons.
+      const list = extractCronArray(toolResponse) ?? extractCronArray(toolInput);
+      if (list) {
+        await this.handleSessionCrons(sessionId, list);
+      }
+    }
   }
 
   /**
-   * Pushes an instruction into the session as a user message the pump (or a
-   * running prompt drain) will process. The uuid is remembered so the drain
+   * Reconciles the loop mirror against a `session_crons` snapshot. Every hook
+   * firing hands the adapter this free, authoritative list of armed crons
+   * (harness-runtime-mechanics §3); reconciling against it heals drift — a cron
+   * armed or deleted by a bare TUI against the same session, or a synthesized
+   * placeholder id upgraded to its real cron id — without a model-costing
+   * CronList. Emits loop_upserted / loop_removed for the resulting transitions.
+   */
+  private async handleSessionCrons(sessionId: string, crons: unknown): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    if (!Array.isArray(crons)) {
+      return;
+    }
+    const ah = session.anyharness;
+    const { upserted, removed } = reconcileSessionCrons(ah, crons, Date.now());
+    if (upserted.length === 0 && removed.length === 0) {
+      return;
+    }
+    this.logger.log(`[anyharness] session_crons reconcile: +${upserted.length} -${removed.length}`);
+    for (const loop of upserted) {
+      await this.sendAnyharnessEvent(sessionId, "loop_upserted", {
+        loop: loopWireFromState(loop),
+        loopId: loop.loopId,
+      });
+    }
+    for (const loopId of removed) {
+      await this.sendAnyharnessEvent(sessionId, "loop_removed", { loopId });
+    }
+    // A reconcile can satisfy an outstanding loop/clear (a cron deleted out of
+    // band vanished from the snapshot).
+    if (removed.length > 0) {
+      for (const watcher of ah.loopClearWatchers) {
+        watcher();
+      }
+    }
+  }
+
+  /** The per-subagent transcript path used as its live nested-transcript feed. */
+  private subagentFeedPathFor(session: Session, sessionId: string, taskId: string): string {
+    const parentTranscript =
+      session.anyharness.transcriptPath ??
+      this.pendingTranscriptPaths.get(sessionId) ??
+      computeTranscriptPath(CLAUDE_CONFIG_DIR, session.cwd, sessionId);
+    return subagentFeedPath(parentTranscript, sessionId, taskId);
+  }
+
+  /**
+   * Normalizes a Claude task lifecycle system event into the read-only activity
+   * roster. Background bash (`task_type: local_bash`) becomes an
+   * ActivityProcess (process_upserted); a subagent (`task_type: local_agent`)
+   * becomes an ActivitySubagent (subagent_upserted). The feed transport is
+   * always a membrane-side tail_file(path) that the runtime swaps for an opaque
+   * FeedRef. Best-effort — a roster miss must never break the drain.
+   */
+  private async handleTaskEvent(sessionId: string, msg: SDKMessage): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const ah = session.anyharness;
+    const now = Date.now();
+    try {
+      const event = msg as unknown as {
+        subtype: "task_started" | "task_progress" | "task_notification";
+        task_id?: string;
+        tool_use_id?: string;
+        task_type?: string;
+        subagent_type?: string;
+        agent_type?: string;
+        model?: string;
+        description?: string;
+        prompt?: string;
+        summary?: string;
+        status?: "completed" | "failed" | "stopped";
+        output_file?: string;
+        usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
+      };
+      const taskId = event.task_id;
+      if (!taskId) {
+        return;
+      }
+      const usage = event.usage
+        ? {
+            totalTokens: event.usage.total_tokens,
+            toolUses: event.usage.tool_uses,
+            durationMs: event.usage.duration_ms,
+          }
+        : null;
+      const outputFile = typeof event.output_file === "string" ? event.output_file : null;
+
+      if (event.subtype === "task_started") {
+        if (event.task_type === "local_agent") {
+          const subagent: SubagentState = {
+            id: taskId,
+            agentType: event.subagent_type ?? event.agent_type ?? null,
+            description: event.description ?? null,
+            prompt: event.prompt ?? null,
+            model: event.model ?? null,
+            background: true,
+            status: "running",
+            summary: null,
+            usage: null,
+            // The per-agent transcript exists from spawn — open a live feed now.
+            feed: {
+              transport: "tail_file",
+              path: this.subagentFeedPathFor(session, sessionId, taskId),
+            },
+            updatedAtMs: now,
+          };
+          ah.subagents.set(taskId, subagent);
+          await this.sendAnyharnessEvent(sessionId, "subagent_upserted", { subagent });
+          return;
+        }
+        // local_bash (and any other non-agent task) → a background process.
+        const captured = event.tool_use_id ? ah.taskToolUse.get(event.tool_use_id) : undefined;
+        const process: ProcessState = {
+          id: taskId,
+          command: captured?.command || event.description || "",
+          cwd: session.cwd ?? null,
+          status: "running",
+          exitCode: null,
+          pid: null,
+          startedAtMs: now,
+          endedAtMs: null,
+          feed: captured?.outputFile ? { transport: "tail_file", path: captured.outputFile } : null,
+          toolUseId: event.tool_use_id ?? null,
+          updatedAtMs: now,
+        };
+        ah.processes.set(taskId, process);
+        await this.sendAnyharnessEvent(sessionId, "process_upserted", {
+          process: processWireFromState(process),
+        });
+        return;
+      }
+
+      if (event.subtype === "task_progress") {
+        const subagent = ah.subagents.get(taskId);
+        if (subagent) {
+          if (usage) {
+            subagent.usage = usage;
+          }
+          if (event.summary) {
+            subagent.summary = event.summary;
+          }
+          subagent.updatedAtMs = now;
+          await this.sendAnyharnessEvent(sessionId, "subagent_upserted", { subagent });
+        }
+        return;
+      }
+
+      // task_notification: terminal status (completed | failed | stopped).
+      const terminalFailed = event.status === "failed" || event.status === "stopped";
+      const subagent = ah.subagents.get(taskId);
+      if (subagent) {
+        subagent.status = terminalFailed ? "failed" : "completed";
+        if (event.summary) {
+          subagent.summary = event.summary;
+        }
+        if (usage) {
+          subagent.usage = usage;
+        }
+        if (outputFile) {
+          subagent.feed = { transport: "tail_file", path: outputFile };
+        }
+        subagent.updatedAtMs = now;
+        await this.sendAnyharnessEvent(sessionId, "subagent_upserted", { subagent });
+        return;
+      }
+      const process = ah.processes.get(taskId);
+      if (process) {
+        process.status = "exited";
+        // Claude reports no numeric exit code; leave it null (unknown).
+        process.endedAtMs = now;
+        if (outputFile) {
+          process.feed = { transport: "tail_file", path: outputFile };
+        }
+        process.updatedAtMs = now;
+        await this.sendAnyharnessEvent(sessionId, "process_upserted", {
+          process: processWireFromState(process),
+        });
+      }
+    } catch (error) {
+      this.logger.error(`[anyharness] handleTaskEvent failed:`, error);
+    }
+  }
+
+  /**
+   * Captures the two facts the task lifecycle events don't carry themselves: a
+   * background Bash command (from the spawning assistant tool_use) and its
+   * output-file path (from the tool_result). Keyed by tool_use id so task_started
+   * — which carries tool_use_id — can resolve the command, and so a process feed
+   * can open on the live output file before the completion notification.
+   */
+  private captureTaskIo(sessionId: string, message: SDKMessage): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const ah = session.anyharness;
+    const content = (message as { message?: { content?: unknown } }).message?.content;
+    if (!Array.isArray(content)) {
+      return;
+    }
+    for (const block of content) {
+      if (typeof block !== "object" || block === null) {
+        continue;
+      }
+      const b = block as {
+        type?: string;
+        id?: string;
+        name?: string;
+        input?: { command?: unknown };
+        tool_use_id?: string;
+        content?: unknown;
+      };
+      if (b.type === "tool_use" && typeof b.id === "string") {
+        const command =
+          b.input && typeof b.input.command === "string" ? b.input.command : undefined;
+        if (command) {
+          const existing = ah.taskToolUse.get(b.id) ?? {};
+          existing.command = command;
+          ah.taskToolUse.set(b.id, existing);
+        }
+      } else if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
+        const outputFile = parseBackgroundOutputFile(b.content);
+        if (!outputFile) {
+          continue;
+        }
+        const existing = ah.taskToolUse.get(b.tool_use_id) ?? {};
+        existing.outputFile = outputFile;
+        ah.taskToolUse.set(b.tool_use_id, existing);
+        // If the process already started, attach the live feed and re-emit.
+        const process = [...ah.processes.values()].find((p) => p.toolUseId === b.tool_use_id);
+        if (process && !process.feed) {
+          process.feed = { transport: "tail_file", path: outputFile };
+          process.updatedAtMs = Date.now();
+          void this.sendAnyharnessEvent(sessionId, "process_upserted", {
+            process: processWireFromState(process),
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Queues a `/goal …` / `/loop …` instruction for injection as a user message.
+   * If the session is idle it is injected immediately; otherwise it is held in
+   * `deferredInjections` and flushed at the next turn boundary. This is the goal
+   * deferral fix: a `/goal` local command sent while a turn is streaming
+   * silently degrades to a never-executing queued prompt (the 30s-timeout bug),
+   * so we hold it until idle. `onInjected` fires the instant the message is
+   * pushed — callers start their native-confirmation clock there, so it can
+   * never elapse during the preceding turn. The uuid is remembered so the drain
    * loop can tell these turns apart from native cron wakes and keep their
    * replays out of the client feed.
    */
-  private pushInjectedInstruction(sessionId: string, session: Session, text: string): void {
+  private enqueueInjectedInstruction(
+    sessionId: string,
+    session: Session,
+    text: string,
+    onInjected?: () => void,
+  ): void {
     const uuid = randomUUID();
     session.anyharness.injectedUuids.add(uuid);
-    const message: SDKUserMessage = {
-      type: "user",
-      message: { role: "user", content: [{ type: "text", text }] },
-      session_id: sessionId,
-      parent_tool_use_id: null,
-      uuid,
-    };
-    session.input.push(message);
+    session.anyharness.deferredInjections.push({ uuid, text, onInjected });
+    this.tryFlushDeferredInjections(sessionId);
+  }
+
+  /** True when no turn is streaming, so an injected local command will execute. */
+  private canInjectNow(session: Session): boolean {
+    return !session.promptRunning && !session.anyharness.turnActive;
+  }
+
+  /**
+   * Flushes queued injections into the message stream once the session is idle,
+   * then ensures a pump drains the resulting turn(s). No-op mid-turn; the prompt
+   * finally and the idle-pump loop re-drive it at each turn boundary.
+   */
+  private tryFlushDeferredInjections(sessionId: string): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const ah = session.anyharness;
+    if (ah.deferredInjections.length === 0 || !this.canInjectNow(session)) {
+      return;
+    }
+    const pending = ah.deferredInjections.splice(0, ah.deferredInjections.length);
+    for (const injection of pending) {
+      const message: SDKUserMessage = {
+        type: "user",
+        message: { role: "user", content: [{ type: "text", text: injection.text }] },
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        uuid: injection.uuid as SDKUserMessage["uuid"],
+      };
+      session.input.push(message);
+      injection.onInjected?.();
+    }
     // Ensure something drains the resulting turn when no prompt is active.
     this.startIdlePump(sessionId);
   }
@@ -1709,7 +2105,13 @@ export class ClaudeAcpAgent implements Agent {
   private async sendAnyharnessEvent(
     sessionId: string,
     transcriptEvent: AnyharnessTranscriptEvent,
-    payload: { goal?: GoalWire; loop?: LoopWire; loopId?: string },
+    payload: {
+      goal?: GoalWire;
+      loop?: LoopWire;
+      loopId?: string;
+      process?: ProcessWire;
+      subagent?: SubagentWire;
+    },
   ): Promise<void> {
     try {
       await this.client.sessionUpdate({
@@ -2512,6 +2914,11 @@ export class ClaudeAcpAgent implements Agent {
                 if (typeof input.transcript_path === "string") {
                   this.noteTranscriptPath(sessionId, input.transcript_path);
                 }
+                // SessionStart carries session_crons too — reconcile the loop
+                // mirror so a resumed session's re-armed crons heal on attach.
+                if (input.session_crons !== undefined) {
+                  await this.handleSessionCrons(sessionId, input.session_crons);
+                }
                 return { continue: true };
               },
             ],
@@ -2526,6 +2933,7 @@ export class ClaudeAcpAgent implements Agent {
                   this.noteTranscriptPath(sessionId, transcriptPath),
                 onCronTool: (toolName, toolInput, toolResponse) =>
                   this.handleCronTool(sessionId, toolName, toolInput, toolResponse),
+                onSessionCrons: (crons) => this.handleSessionCrons(sessionId, crons),
                 onEnterPlanMode: async () => {
                   await this.client.sessionUpdate({
                     sessionId,
