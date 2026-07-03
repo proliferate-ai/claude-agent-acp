@@ -5,10 +5,18 @@ import * as path from "node:path";
 import { AgentSideConnection, RequestError, SessionNotification } from "@agentclientprotocol/sdk";
 import { ClaudeAcpAgent } from "../acp-agent.js";
 import {
+  AnyharnessSessionState,
   classifyGoalStatus,
+  extractCronId,
   extractGoalStatus,
+  isSyntheticLoopId,
+  LoopState,
   newAnyharnessSessionState,
+  parseBackgroundOutputFile,
+  parseCronIdFromResult,
   readLastGoalStatus,
+  reconcileSessionCrons,
+  subagentFeedPath,
   TranscriptTailer,
 } from "../anyharness.js";
 import { Pushable } from "../utils.js";
@@ -155,6 +163,179 @@ describe("TranscriptTailer", () => {
     } finally {
       tailer.dispose();
     }
+  });
+});
+
+function activeLoop(overrides: Partial<LoopState> = {}): LoopState {
+  return {
+    loopId: "loop-1",
+    prompt: "ping",
+    schedule: { kind: "cron", expr: "*/1 * * * *" },
+    recurring: true,
+    status: "active",
+    lastFiredAtMs: null,
+    fireCount: 0,
+    updatedAtMs: 0,
+    ...overrides,
+  };
+}
+
+describe("reconcileSessionCrons", () => {
+  function state(): AnyharnessSessionState {
+    return newAnyharnessSessionState(true);
+  }
+
+  it("upserts a cron present in the snapshot but absent from the mirror", () => {
+    const s = state();
+    const result = reconcileSessionCrons(
+      s,
+      [{ id: "cron-real-1", cron: "*/5 * * * *", prompt: "ping PING.log", recurring: true }],
+      1000,
+    );
+    expect(result.upserted.map((l) => l.loopId)).toEqual(["cron-real-1"]);
+    expect(result.removed).toEqual([]);
+    const loop = s.loops.get("cron-real-1");
+    expect(loop).toMatchObject({
+      prompt: "ping PING.log",
+      schedule: { kind: "cron", expr: "*/5 * * * *" },
+      status: "active",
+    });
+  });
+
+  it("is a no-op when the snapshot matches the mirror (steady state)", () => {
+    const s = state();
+    s.loops.set(
+      "cron-real-1",
+      activeLoop({
+        loopId: "cron-real-1",
+        prompt: "p",
+        schedule: { kind: "cron", expr: "* * * * *" },
+      }),
+    );
+    // NOTE: loopId "cron-real-1" is treated as a real id below only because it is
+    // returned verbatim in the snapshot; the synthetic check is by prefix.
+    const result = reconcileSessionCrons(
+      s,
+      [{ id: "cron-real-1", cron: "* * * * *", prompt: "p", recurring: true }],
+      2000,
+    );
+    expect(result.upserted).toEqual([]);
+    expect(result.removed).toEqual([]);
+  });
+
+  it("removes a real-id active loop that vanished from the snapshot", () => {
+    const s = state();
+    s.loops.set("job_abc", activeLoop({ loopId: "job_abc" }));
+    const result = reconcileSessionCrons(s, [], 3000);
+    expect(result.removed).toEqual(["job_abc"]);
+    expect(s.loops.get("job_abc")?.status).toBe("cleared");
+  });
+
+  it("leaves synthetic-id loops untouched when absent from the snapshot", () => {
+    const s = state();
+    s.loops.set("provisional-xyz", activeLoop({ loopId: "provisional-xyz" }));
+    s.loops.set("cron-abc", activeLoop({ loopId: "cron-abc" }));
+    const result = reconcileSessionCrons(s, [], 4000);
+    // Neither synthetic id is a confirmed external deletion.
+    expect(result.removed).toEqual([]);
+    expect(s.loops.get("provisional-xyz")?.status).toBe("active");
+    expect(s.loops.get("cron-abc")?.status).toBe("active");
+  });
+
+  it("upgrades a synthetic loop to its real cron id by prompt match, carrying fire bookkeeping", () => {
+    const s = state();
+    s.loops.set(
+      "provisional-xyz",
+      activeLoop({
+        loopId: "provisional-xyz",
+        prompt: "ping PING.log",
+        fireCount: 3,
+        lastFiredAtMs: 999,
+      }),
+    );
+    const result = reconcileSessionCrons(
+      s,
+      [{ jobId: "job_real", cron: "*/1 * * * *", prompt: "ping PING.log" }],
+      5000,
+    );
+    expect(result.removed).toEqual(["provisional-xyz"]);
+    expect(result.upserted.map((l) => l.loopId)).toEqual(["job_real"]);
+    expect(s.loops.has("provisional-xyz")).toBe(false);
+    expect(s.loops.get("job_real")).toMatchObject({ fireCount: 3, lastFiredAtMs: 999 });
+  });
+
+  it("ignores non-array snapshots and crons without an id", () => {
+    const s = state();
+    expect(reconcileSessionCrons(s, undefined, 0)).toEqual({ upserted: [], removed: [] });
+    expect(reconcileSessionCrons(s, [{ prompt: "no id here" }], 0)).toEqual({
+      upserted: [],
+      removed: [],
+    });
+    expect(s.loops.size).toBe(0);
+  });
+});
+
+describe("isSyntheticLoopId / extractCronId", () => {
+  it("classifies our synthesized placeholder ids", () => {
+    expect(isSyntheticLoopId("provisional-abcd")).toBe(true);
+    expect(isSyntheticLoopId("cron-abcd")).toBe(true);
+    expect(isSyntheticLoopId("job_real_123")).toBe(false);
+  });
+
+  it("extracts a cron id from varied IO shapes", () => {
+    expect(extractCronId({ id: "j1" })).toBe("j1");
+    expect(extractCronId({ jobId: 42 })).toBe("42");
+    expect(extractCronId({ result: { cron_id: "c9" } })).toBe("c9");
+    expect(extractCronId({ nothing: true })).toBeUndefined();
+  });
+});
+
+describe("parseCronIdFromResult", () => {
+  // The exact CronCreate result string captured live from Claude Code 2.1.199.
+  const liveResult =
+    "Scheduled recurring job dad38e14 (Every minute). Session-only (not written to disk, " +
+    "dies when Claude exits). Auto-expires after 7 days. Use CronDelete to cancel sooner.";
+
+  it("parses the real cron id out of the live CronCreate prose result", () => {
+    expect(parseCronIdFromResult(liveResult)).toBe("dad38e14");
+  });
+
+  it("parses from a content-block array and a wrapped object", () => {
+    expect(parseCronIdFromResult([{ type: "text", text: liveResult }])).toBe("dad38e14");
+    expect(parseCronIdFromResult({ content: liveResult })).toBe("dad38e14");
+  });
+
+  it("returns null when the result has no job id", () => {
+    expect(parseCronIdFromResult("nothing scheduled")).toBeNull();
+    expect(parseCronIdFromResult(null)).toBeNull();
+  });
+});
+
+describe("parseBackgroundOutputFile", () => {
+  it("parses the output-file path from a background-bash tool_result string", () => {
+    expect(
+      parseBackgroundOutputFile("Command running in background with ID: t1, output → /tmp/out.log"),
+    ).toBe("/tmp/out.log");
+    expect(parseBackgroundOutputFile("logs — output: /var/log/x.txt.")).toBe("/var/log/x.txt");
+  });
+
+  it("parses from an array-of-blocks tool_result body", () => {
+    expect(
+      parseBackgroundOutputFile([{ type: "text", text: "running, output -> /tmp/a.log" }]),
+    ).toBe("/tmp/a.log");
+  });
+
+  it("returns null when no output path is present", () => {
+    expect(parseBackgroundOutputFile("done")).toBeNull();
+    expect(parseBackgroundOutputFile(null)).toBeNull();
+  });
+});
+
+describe("subagentFeedPath", () => {
+  it("derives the per-agent transcript path from the parent transcript", () => {
+    expect(subagentFeedPath("/home/u/.claude/projects/proj/sess.jsonl", "sess", "task9")).toBe(
+      "/home/u/.claude/projects/proj/sess/subagents/agent-task9.jsonl",
+    );
   });
 });
 
@@ -711,6 +892,333 @@ describe("extMethod dispatch", () => {
       outputTokens: 2,
       cachedReadTokens: 0,
       cachedWriteTokens: 0,
+    });
+  });
+
+  // --- Helpers to reach the private roster / reconcile / injection paths. ---
+  const call = (agent: ClaudeAcpAgent, method: string, ...args: unknown[]): unknown =>
+    (agent as unknown as Record<string, (...a: unknown[]) => unknown>)[method](...args);
+
+  function anyharnessEvents(updates: SessionNotification[]): {
+    transcriptEvent?: string;
+    loopId?: string;
+    loop?: { loopId?: string };
+    process?: Record<string, unknown>;
+    subagent?: Record<string, unknown>;
+  }[] {
+    return updates
+      .map(
+        (u) => (u.update as { _meta?: { anyharness?: Record<string, unknown> } })._meta?.anyharness,
+      )
+      .filter((m): m is NonNullable<typeof m> => !!m && !!m.transcriptEvent) as any;
+  }
+
+  describe("session_crons reconcile emission", () => {
+    it("emits loop_upserted for a newly-observed cron then loop_removed when it vanishes", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1");
+
+      await call(agent, "handleSessionCrons", "s1", [
+        { id: "job_1", cron: "*/1 * * * *", prompt: "append ping", recurring: true },
+      ]);
+      expect(session.anyharness.loops.get("job_1")?.status).toBe("active");
+      let events = anyharnessEvents(updates);
+      expect(events.map((e) => e.transcriptEvent)).toEqual(["loop_upserted"]);
+      expect(events[0].loop?.loopId).toBe("job_1");
+
+      // A steady-state snapshot emits nothing.
+      await call(agent, "handleSessionCrons", "s1", [
+        { id: "job_1", cron: "*/1 * * * *", prompt: "append ping", recurring: true },
+      ]);
+      expect(anyharnessEvents(updates)).toHaveLength(1);
+
+      // The cron disappears (deleted out of band) → loop_removed.
+      await call(agent, "handleSessionCrons", "s1", []);
+      events = anyharnessEvents(updates);
+      expect(events.map((e) => e.transcriptEvent)).toEqual(["loop_upserted", "loop_removed"]);
+      expect(events[1].loopId).toBe("job_1");
+      expect(session.anyharness.loops.get("job_1")?.status).toBe("cleared");
+    });
+  });
+
+  describe("CronCreate observation", () => {
+    it("mirrors the real cron id parsed from the live result string and emits loop_upserted", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1");
+      // A loop/set is awaiting its CronCreate.
+      let resolved: LoopState | null = null;
+      session.anyharness.pendingLoopSets.push({
+        prompt: "append the word ping to PING.log",
+        schedule: { kind: "interval", expr: "1m" },
+        recurring: true,
+        requestedAtMs: Date.now(),
+        resolve: (loop) => {
+          resolved = loop;
+        },
+      });
+
+      await call(
+        agent,
+        "handleCronTool",
+        "s1",
+        "CronCreate",
+        { cron: "*/1 * * * *", prompt: "append the word ping to PING.log", recurring: true },
+        "Scheduled recurring job dad38e14 (Every minute). Session-only. Use CronDelete to cancel.",
+      );
+
+      // The real harness id — not a synthesized "cron-…" placeholder.
+      expect(session.anyharness.loops.has("dad38e14")).toBe(true);
+      expect(resolved).not.toBeNull();
+      expect(resolved!.loopId).toBe("dad38e14");
+      const events = anyharnessEvents(updates);
+      expect(events.map((e) => e.transcriptEvent)).toEqual(["loop_upserted"]);
+      expect(events[0].loop?.loopId).toBe("dad38e14");
+    });
+  });
+
+  describe("activity roster emission", () => {
+    it("task_started (local_bash) emits process_upserted with the captured command", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+
+      // The spawning assistant tool_use carries the command; captureTaskIo files it.
+      call(agent, "captureTaskIo", "s1", {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tu1",
+              name: "Bash",
+              input: { command: "sleep 30 && echo OK" },
+            },
+          ],
+        },
+      });
+
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_started",
+        task_id: "t1",
+        tool_use_id: "tu1",
+        task_type: "local_bash",
+        description: "run sleep",
+      });
+
+      const proc = session.anyharness.processes.get("t1");
+      expect(proc).toMatchObject({ id: "t1", command: "sleep 30 && echo OK", status: "running" });
+      const events = anyharnessEvents(updates);
+      expect(events.map((e) => e.transcriptEvent)).toEqual(["process_upserted"]);
+      expect(events[0].process).toMatchObject({
+        id: "t1",
+        status: "running",
+        command: "sleep 30 && echo OK",
+      });
+    });
+
+    it("captures the output file from the tool_result and opens a live feed on the running process", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_started",
+        task_id: "t1",
+        tool_use_id: "tu1",
+        task_type: "local_bash",
+        description: "run",
+      });
+      expect(session.anyharness.processes.get("t1")?.feed).toBeNull();
+
+      call(agent, "captureTaskIo", "s1", {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu1",
+              content: "Command running in background with ID: t1, output → /tmp/out.log",
+            },
+          ],
+        },
+      });
+
+      expect(session.anyharness.processes.get("t1")?.feed).toEqual({
+        transport: "tail_file",
+        path: "/tmp/out.log",
+      });
+      // The feed discovery re-emits process_upserted so the runtime can attach.
+      const feedEvents = anyharnessEvents(updates).filter(
+        (e) => e.transcriptEvent === "process_upserted" && e.process?.feed,
+      );
+      expect(feedEvents).toHaveLength(1);
+    });
+
+    it("task_notification flips the process to exited and attaches the output-file feed", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_started",
+        task_id: "t1",
+        tool_use_id: "tu1",
+        task_type: "local_bash",
+        description: "run",
+      });
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "t1",
+        status: "completed",
+        output_file: "/tmp/out.log",
+        summary: "done",
+      });
+      const proc = session.anyharness.processes.get("t1");
+      expect(proc).toMatchObject({ status: "exited", exitCode: null });
+      expect(proc?.endedAtMs).not.toBeNull();
+      expect(proc?.feed).toEqual({ transport: "tail_file", path: "/tmp/out.log" });
+      const allEvents = anyharnessEvents(updates);
+      const last = allEvents[allEvents.length - 1];
+      expect(last?.transcriptEvent).toBe("process_upserted");
+      expect(last?.process).toMatchObject({ status: "exited" });
+    });
+
+    it("task_started (local_agent) emits subagent_upserted with a derived transcript feed", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", "/home/u/.claude/projects/proj/s1.jsonl");
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_started",
+        task_id: "a1",
+        tool_use_id: "tu2",
+        task_type: "local_agent",
+        subagent_type: "code-reviewer",
+        description: "review the diff",
+        prompt: "please review",
+      });
+      const sub = session.anyharness.subagents.get("a1");
+      expect(sub).toMatchObject({
+        id: "a1",
+        agentType: "code-reviewer",
+        prompt: "please review",
+        status: "running",
+        background: true,
+      });
+      expect(sub?.feed).toEqual({
+        transport: "tail_file",
+        path: "/home/u/.claude/projects/proj/s1/subagents/agent-a1.jsonl",
+      });
+      const events = anyharnessEvents(updates);
+      expect(events.map((e) => e.transcriptEvent)).toEqual(["subagent_upserted"]);
+    });
+
+    it("task_progress updates subagent usage; task_notification failed flips it to failed", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_started",
+        task_id: "a1",
+        task_type: "local_agent",
+        subagent_type: "general-purpose",
+      });
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_progress",
+        task_id: "a1",
+        usage: { total_tokens: 1200, tool_uses: 4, duration_ms: 8000 },
+      });
+      expect(session.anyharness.subagents.get("a1")?.usage).toEqual({
+        totalTokens: 1200,
+        toolUses: 4,
+        durationMs: 8000,
+      });
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "a1",
+        status: "failed",
+        output_file: "/x/agent-a1.jsonl",
+        summary: "blew up",
+      });
+      const sub = session.anyharness.subagents.get("a1");
+      expect(sub).toMatchObject({ status: "failed", summary: "blew up" });
+      const events = anyharnessEvents(updates).map((e) => e.transcriptEvent);
+      expect(events).toEqual(["subagent_upserted", "subagent_upserted", "subagent_upserted"]);
+    });
+
+    it("activity/list serves the whole mirror from tracked state", async () => {
+      const { agent } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_started",
+        task_id: "t1",
+        tool_use_id: "tu1",
+        task_type: "local_bash",
+        description: "run",
+      });
+      await call(agent, "handleSessionCrons", "s1", [
+        { id: "job_1", cron: "* * * * *", prompt: "p" },
+      ]);
+      const result = (await agent.extMethod("_anyharness/activity/list", { sessionId: "s1" })) as {
+        loops: unknown[];
+        processes: { id: string }[];
+        subagents: unknown[];
+        goal: unknown;
+      };
+      expect(result.processes.map((p) => p.id)).toEqual(["t1"]);
+      expect(result.loops).toHaveLength(1);
+      expect(session.anyharness.processes.size).toBe(1);
+    });
+  });
+
+  describe("goal deferral behind a streaming turn", () => {
+    it("defers a mid-turn goal/set to the turn boundary and returns a provisional pending goal", async () => {
+      const { agent } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      // A turn is streaming — a `/goal` now would degrade to a queued command.
+      session.promptRunning = true;
+      const push = vi.spyOn(session.input, "push");
+
+      const result = (await agent.extMethod("_anyharness/goal/set", {
+        sessionId: "s1",
+        objective: "DONE.txt exists",
+      })) as { goal: { objective: string; status: string; nativeStatus: string; native: boolean } };
+
+      // Returns immediately (no 30s block) with a provisional pending goal.
+      expect(result.goal).toMatchObject({
+        objective: "DONE.txt exists",
+        status: "active",
+        nativeStatus: "pending_injection",
+        native: true,
+      });
+      // Nothing injected yet, and the mirror is untouched (no optimistic state).
+      expect(push).not.toHaveBeenCalled();
+      expect(session.anyharness.deferredInjections).toHaveLength(1);
+      expect(session.anyharness.goal).toBeNull();
+
+      // The turn ends → flush injects the deferred /goal at the boundary.
+      session.promptRunning = false;
+      session.anyharness.turnActive = false;
+      call(agent, "tryFlushDeferredInjections", "s1");
+      expect(push).toHaveBeenCalledOnce();
+      expect(push.mock.calls[0][0].message.content).toEqual([
+        { type: "text", text: "/goal DONE.txt exists" },
+      ]);
+      expect(session.anyharness.deferredInjections).toHaveLength(0);
+    });
+
+    it("injects immediately when the session is idle (unchanged idle path)", async () => {
+      const { agent } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      const push = vi.spyOn(session.input, "push");
+      // Fire and forget: the idle path blocks on the arm sentinel we never write.
+      void agent.extMethod("_anyharness/goal/set", { sessionId: "s1", objective: "x" });
+      await vi.waitFor(() => expect(push).toHaveBeenCalledOnce(), { timeout: 2000 });
+      expect(push.mock.calls[0][0].message.content).toEqual([{ type: "text", text: "/goal x" }]);
+      expect(session.anyharness.deferredInjections).toHaveLength(0);
     });
   });
 });
