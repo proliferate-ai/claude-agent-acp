@@ -1318,13 +1318,22 @@ export class ClaudeAcpAgent implements Agent {
 
     if (objective === undefined || objective === "") {
       // Status/budget-only patch (codex semantics). Claude goals are always
-      // active and have no token budget — return the current goal unchanged.
+      // active and have no token budget — the patch is a no-op that returns
+      // the current goal unchanged.
       if (!ah.goal || ah.goal.status !== "active") {
         throw RequestError.invalidParams(
           undefined,
           "objective is required (no active goal to patch)",
         );
       }
+      // Emit the tagged goal_updated notification even though nothing changed.
+      // anyharness treats every set as a mutation and blocks on a
+      // goal_updated/goal_met/goal_cleared round-trip after the ext response;
+      // codex always emits one for an objective-omitted patch, so without this
+      // the wait would time out into a 409 despite the call succeeding.
+      await this.sendAnyharnessEvent(sessionId, "goal_updated", {
+        goal: goalWireFromState(ah.goal),
+      });
       return { goal: goalWireFromState(ah.goal) };
     }
 

@@ -255,6 +255,36 @@ describe("extMethod dispatch", () => {
     ).rejects.toMatchObject({ code: -32602 });
   });
 
+  it("emits goal_updated for an objective-omitted status patch so anyharness confirms", async () => {
+    const { agent, updates } = createAgent();
+    const session = injectSession(agent, "s1", tempTranscript());
+    session.anyharness.goal = {
+      objective: "DONE.txt exists",
+      status: "active",
+      nativeStatus: "armed",
+      metReason: null,
+      iterations: null,
+      tokensUsed: null,
+      timeUsedSeconds: null,
+      updatedAtMs: Date.now(),
+    };
+
+    // A status-only patch (no objective) is a no-op for claude, but it must
+    // still emit the tagged notification the anyharness runtime waits on —
+    // otherwise the confirmation wait times out into a 409.
+    const result = (await agent.extMethod("_anyharness/goal/set", {
+      sessionId: "s1",
+      status: "active",
+    })) as { goal: { objective: string; status: string } };
+    expect(result.goal).toMatchObject({ objective: "DONE.txt exists", status: "active" });
+
+    const events = updates
+      .map((u) => (u.update as { _meta?: { anyharness?: { transcriptEvent?: string } } })._meta)
+      .map((meta) => meta?.anyharness?.transcriptEvent)
+      .filter(Boolean);
+    expect(events).toEqual(["goal_updated"]);
+  });
+
   it("confirms goal/set only after the native arm sentinel round-trips", async () => {
     const { agent, updates } = createAgent();
     const transcriptPath = tempTranscript();
