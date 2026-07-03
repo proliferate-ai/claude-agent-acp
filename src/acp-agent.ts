@@ -86,8 +86,10 @@ import {
   ANYHARNESS_SCHEMA_VERSION,
   AnyharnessSessionState,
   AnyharnessTranscriptEvent,
+  classifyGoalStatus,
   computeTranscriptPath,
   extractGoalStatus,
+  GoalStatusRow,
   GoalWire,
   goalWireFromState,
   LoopSchedule,
@@ -95,6 +97,7 @@ import {
   LoopWire,
   loopWireFromState,
   newAnyharnessSessionState,
+  readLastGoalStatus,
   TranscriptTailer,
 } from "./anyharness.js";
 import { SettingsManager } from "./settings.js";
@@ -253,6 +256,11 @@ type Session = {
   /** Goal/loop state + transcript tailer for the anyharness GoalPort/LoopPort
    *  extension. */
   anyharness: AnyharnessSessionState;
+  /**
+   * In-flight query.next() shared between the prompt drain and the idle
+   * pump so an interrupted pump never loses a pulled message.
+   */
+  pendingQueryNext?: Promise<IteratorResult<SDKMessage, void>> | null;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -418,6 +426,13 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+
+// How long the goal/set and goal/clear ext methods wait for the native
+// confirmation (the goal_status sentinel row in the transcript) before
+// failing. Idle sessions confirm in well under a second; a turn in flight
+// degrades /goal commands to queued prompt-mode commands that never execute.
+const GOAL_SET_TIMEOUT_MS = 30_000;
+const GOAL_CLEAR_TIMEOUT_MS = 30_000;
 
 // How long the loop/set and loop/clear ext methods wait for the matching
 // CronCreate/CronDelete tool_use before answering optimistically.
@@ -942,12 +957,15 @@ export class ClaudeAcpAgent implements Agent {
 
     if (session.promptRunning || session.anyharness.pumpRunning) {
       // Either a prompt drain or the idle background pump currently owns the
-      // message stream — queue up and wait for it to hand over.
+      // message stream — queue up and wait for it to hand over. An
+      // idle-blocked pump yields immediately via its interrupt.
       session.input.push(userMessage);
       const order = session.nextPendingOrder++;
-      const cancelled = await new Promise<boolean>((resolve) => {
+      const pending = new Promise<boolean>((resolve) => {
         session.pendingMessages.set(promptUuid, { resolve, order });
       });
+      session.anyharness.pumpInterrupt?.();
+      const cancelled = await pending;
       if (cancelled) {
         return { stopReason: "cancelled" };
       }
@@ -1063,22 +1081,33 @@ export class ClaudeAcpAgent implements Agent {
             pending.resolve(true);
           }
           session.pendingMessages.clear();
-        } else if (session.pendingMessages.size > 0) {
+        } else {
           // This usually should not happen, but in case the loop finishes
           // without claude sending all message replays, we resolve the
           // next pending prompt call to ensure no prompts get stuck.
-          const next = [...session.pendingMessages.entries()].sort(
-            (a, b) => a[1].order - b[1].order,
-          )[0];
-          if (next) {
-            next[1].resolve(false);
-            session.pendingMessages.delete(next[0]);
-          }
+          this.resolveNextPendingPrompt(session);
         }
         // Resume the idle background pump so injected goal/loop instructions
         // and spontaneous cron wake turns keep draining between prompts.
         this.startIdlePump(params.sessionId);
       }
+    }
+  }
+
+  /**
+   * Hands the message stream to the oldest queued prompt() call. Marks
+   * promptRunning before resolving so no idle pump can start (and race the
+   * awakened prompt's drain) in the gap before its continuation runs.
+   */
+  private resolveNextPendingPrompt(session: Session): void {
+    if (session.pendingMessages.size === 0) {
+      return;
+    }
+    const next = [...session.pendingMessages.entries()].sort((a, b) => a[1].order - b[1].order)[0];
+    if (next) {
+      session.promptRunning = true;
+      next[1].resolve(false);
+      session.pendingMessages.delete(next[0]);
     }
   }
 
@@ -1168,28 +1197,44 @@ export class ClaudeAcpAgent implements Agent {
       });
     };
 
+    let messagesSeen = 0;
     while (true) {
-      const nextMessage = session.query.next();
+      const pull = session.pendingQueryNext ?? (session.pendingQueryNext = session.query.next());
       let iteration: IteratorResult<SDKMessage, void>;
-      if (params.owner === "prompt" && params.cancelled) {
-        const next = await Promise.race([nextMessage, params.cancelled]);
+      if (params.owner === "pump" && messagesSeen === 0) {
+        // While idle-blocked (nothing drained yet), let a queued prompt()
+        // take the stream over immediately. The in-flight next() promise is
+        // left on the session so no message is lost across the handoff.
+        const interrupted = new Promise<"interrupted">((resolve) => {
+          session.anyharness.pumpInterrupt = () => resolve("interrupted");
+        });
+        const winner = await Promise.race([pull, interrupted]);
+        session.anyharness.pumpInterrupt = null;
+        if (winner === "interrupted") {
+          return { kind: "handed_off" };
+        }
+        iteration = winner;
+      } else if (params.owner === "prompt" && params.cancelled) {
+        // The #680 force-cancel backstop races the shared pull: a wedged
+        // query.next() that never yields is abandoned so cancel() still
+        // resolves the prompt as "cancelled" per the ACP contract.
+        const next = await Promise.race([pull, params.cancelled]);
         if (params.cancelController?.signal.aborted) {
-          // The SDK never yielded after interrupt() (e.g. a wedged TaskOutput
-          // block — issue #680). Abandon the in-flight next() — swallowing any
-          // later rejection so it can't surface as an unhandled rejection — and
-          // honor the cancel per the ACP contract.
-          void nextMessage.catch(() => {});
+          void pull.catch(() => {});
+          session.pendingQueryNext = null;
           return { kind: "turn_ended", stopReason: "cancelled" };
         }
         iteration = next as IteratorResult<SDKMessage, void>;
       } else {
-        iteration = await nextMessage;
+        iteration = await pull;
       }
+      session.pendingQueryNext = null;
       const { value: message, done } = iteration;
 
       if (done || !message) {
         return { kind: "stream_ended" };
       }
+      messagesSeen += 1;
 
       if (session.emitRawSDKMessages && shouldEmitRawMessage(session.emitRawSDKMessages, message)) {
         await this.client.extNotification("_claude/sdkMessage", {
@@ -1662,7 +1707,9 @@ export class ClaudeAcpAgent implements Agent {
             break;
           }
 
-          if (message.type === "assistant") {
+          if (message.type === "assistant" && message.message.model !== "<synthetic>") {
+            // Synthetic assistant messages are local-command echoes (e.g. an
+            // injected /goal), not evidence of a cron wake turn.
             await markSpontaneousTurn();
           }
 
@@ -1683,6 +1730,7 @@ export class ClaudeAcpAgent implements Agent {
 
             const pending = session.pendingMessages.get(message.uuid as string);
             if (pending) {
+              session.promptRunning = true;
               pending.resolve(false);
               session.pendingMessages.delete(message.uuid as string);
               // the current loop stops with end_turn,
@@ -1915,20 +1963,10 @@ export class ClaudeAcpAgent implements Agent {
       })
       .finally(() => {
         ah.pumpRunning = false;
-        // If a prompt queued up while the pump was dying, unstick it the same
-        // way prompt() unsticks the next pending prompt.
-        if (
-          this.sessions[sessionId] === session &&
-          !session.promptRunning &&
-          session.pendingMessages.size > 0
-        ) {
-          const next = [...session.pendingMessages.entries()].sort(
-            (a, b) => a[1].order - b[1].order,
-          )[0];
-          if (next) {
-            next[1].resolve(false);
-            session.pendingMessages.delete(next[0]);
-          }
+        // If a prompt queued up while the pump was exiting, unstick it the
+        // same way prompt() unsticks the next pending prompt.
+        if (this.sessions[sessionId] === session && !session.promptRunning) {
+          this.resolveNextPendingPrompt(session);
         }
       });
   }
@@ -1936,6 +1974,11 @@ export class ClaudeAcpAgent implements Agent {
   private async runIdlePump(sessionId: string, session: Session): Promise<void> {
     while (true) {
       if (this.sessions[sessionId] !== session || session.promptRunning) {
+        return;
+      }
+      if (session.pendingMessages.size > 0) {
+        // A prompt queued while a spontaneous turn was draining — yield at
+        // the turn boundary (the finally above resolves it).
         return;
       }
       session.cancelled = false;
@@ -1997,13 +2040,13 @@ export class ClaudeAcpAgent implements Agent {
 
     switch (normalized) {
       case "anyharness/goal/set":
-        return this.anyharnessGoalSet(sessionId, session, params);
+        return await this.anyharnessGoalSet(sessionId, session, params);
       case "anyharness/goal/get": {
         const goal = session.anyharness.goal;
         return { goal: goal ? goalWireFromState(goal) : null };
       }
       case "anyharness/goal/clear":
-        return this.anyharnessGoalClear(sessionId, session);
+        return await this.anyharnessGoalClear(sessionId, session);
       case "anyharness/loop/set":
         return await this.anyharnessLoopSet(sessionId, session, params);
       case "anyharness/loop/clear":
@@ -2015,63 +2058,124 @@ export class ClaudeAcpAgent implements Agent {
     }
   }
 
-  private anyharnessGoalSet(
+  /**
+   * Registers a bounded wait for a goal_status transcript row matching the
+   * predicate. Rows are delivered by handleTranscriptRow AFTER the mirror
+   * has transitioned and the tagged notification has been emitted, so a
+   * resolved wait means the native write round-tripped.
+   */
+  private waitForGoalRow(
+    session: Session,
+    predicate: (row: GoalStatusRow) => boolean,
+    timeoutMs: number,
+  ): Promise<GoalStatusRow | null> {
+    const ah = session.anyharness;
+    return new Promise<GoalStatusRow | null>((resolve) => {
+      const watcher = (row: GoalStatusRow) => {
+        if (!predicate(row)) {
+          return;
+        }
+        remove();
+        clearTimeout(timer);
+        resolve(row);
+      };
+      const remove = () => {
+        const index = ah.goalRowWatchers.indexOf(watcher);
+        if (index >= 0) {
+          ah.goalRowWatchers.splice(index, 1);
+        }
+      };
+      const timer = setTimeout(() => {
+        remove();
+        resolve(null);
+      }, timeoutMs);
+      timer.unref?.();
+      ah.goalRowWatchers.push(watcher);
+    });
+  }
+
+  private async anyharnessGoalSet(
     sessionId: string,
     session: Session,
     params: Record<string, unknown>,
-  ): { goal: GoalWire } {
+  ): Promise<{ goal: GoalWire }> {
     const ah = session.anyharness;
+    const status = typeof params.status === "string" ? params.status : undefined;
+    if (status !== undefined && status !== "active" && status !== "paused") {
+      throw RequestError.invalidParams(undefined, 'status must be "active" or "paused"');
+    }
+    if (status === "paused") {
+      throw RequestError.invalidParams(
+        undefined,
+        'status "paused" is not supported: Claude Code has no native goal pause',
+      );
+    }
     const objective = typeof params.objective === "string" ? params.objective.trim() : undefined;
 
     if (objective === undefined || objective === "") {
-      // Status/budget-only patch (codex semantics). Claude has no native
-      // pause or token budget — return the current goal unchanged.
-      if (!ah.goal) {
+      // Status/budget-only patch (codex semantics). Claude goals are always
+      // active and have no token budget — return the current goal unchanged.
+      if (!ah.goal || ah.goal.status !== "active") {
         throw RequestError.invalidParams(
           undefined,
-          "objective is required (no goal is currently set)",
+          "objective is required (no active goal to patch)",
         );
       }
       return { goal: goalWireFromState(ah.goal) };
     }
 
     this.ensureTranscriptTailer(sessionId, session);
-    // Native semantics: "/goal <condition>" arms the goal; re-sending replaces.
+    // Native semantics: "/goal <condition>" arms the goal; re-sending
+    // replaces. The mirror transitions only once the native arm sentinel
+    // round-trips through the transcript — no optimistic saved-state.
+    const confirmed = this.waitForGoalRow(
+      session,
+      (row) => classifyGoalStatus(row) === "armed" && (row.condition ?? "").trim() === objective,
+      GOAL_SET_TIMEOUT_MS,
+    );
     this.pushInjectedInstruction(sessionId, session, `/goal ${objective}`);
 
-    ah.goal = {
-      objective,
-      status: "active",
-      nativeStatus: "set",
-      metReason: null,
-      iterations: null,
-      tokensUsed: null,
-      timeUsedSeconds: null,
-      updatedAtMs: Date.now(),
-    };
-    ah.goalArmAnnounced = objective;
-    const wire = goalWireFromState(ah.goal);
-    void this.sendAnyharnessEvent(sessionId, "goal_updated", { goal: wire });
-    return { goal: wire };
+    const row = await confirmed;
+    if (!row || !ah.goal) {
+      throw RequestError.internalError(
+        undefined,
+        `goal arming was not confirmed by the harness within ${GOAL_SET_TIMEOUT_MS}ms ` +
+          "(goal commands sent while a turn is streaming queue as prompt-mode commands and do not execute)",
+      );
+    }
+    return { goal: goalWireFromState(ah.goal) };
   }
 
-  private anyharnessGoalClear(sessionId: string, session: Session): { cleared: boolean } {
+  private async anyharnessGoalClear(
+    sessionId: string,
+    session: Session,
+  ): Promise<{ cleared: boolean }> {
     const ah = session.anyharness;
     const hadActiveGoal = ah.goal !== null && ah.goal.status === "active";
 
+    this.ensureTranscriptTailer(sessionId, session);
+    const confirmed = this.waitForGoalRow(
+      session,
+      (row) => classifyGoalStatus(row) === "cleared",
+      GOAL_CLEAR_TIMEOUT_MS,
+    );
+    // Always send the native clear so mirror drift heals; with no native
+    // goal armed it is a zero-token no-op ("No goal set") that writes no
+    // transcript row, so only wait for confirmation when one is expected.
     this.pushInjectedInstruction(sessionId, session, "/goal clear");
-
-    if (ah.goal) {
-      ah.goal = {
-        ...ah.goal,
-        status: "cleared",
-        nativeStatus: "cleared",
-        updatedAtMs: Date.now(),
-      };
+    if (!hadActiveGoal) {
+      return { cleared: false };
     }
-    ah.goalArmAnnounced = null;
-    void this.sendAnyharnessEvent(sessionId, "goal_cleared", {});
-    return { cleared: hadActiveGoal };
+
+    const row = await confirmed;
+    if (!row) {
+      throw RequestError.internalError(
+        undefined,
+        `goal clear was not confirmed by the harness within ${GOAL_CLEAR_TIMEOUT_MS}ms ` +
+          "(goal commands sent while a turn is streaming queue as prompt-mode commands and do not execute)",
+      );
+    }
+    return { cleared: true };
   }
 
   private async anyharnessLoopSet(
@@ -2356,6 +2460,27 @@ export class ClaudeAcpAgent implements Agent {
       computeTranscriptPath(CLAUDE_CONFIG_DIR, session.cwd, sessionId);
     this.pendingTranscriptPaths.delete(sessionId);
     ah.transcriptPath = transcriptPath;
+
+    if (!ah.tailFromStart && !ah.goal) {
+      // Resumed/forked sessions tail from EOF, but a native goal survives
+      // --resume — seed the mirror from the last goal_status row already in
+      // the transcript so goal/get reconciles without a fresh arm.
+      const last = readLastGoalStatus(transcriptPath);
+      const lastKind = last ? classifyGoalStatus(last) : null;
+      if (last && (lastKind === "armed" || lastKind === "progress")) {
+        ah.goal = {
+          objective: last.condition ?? "",
+          status: "active",
+          nativeStatus: lastKind === "armed" ? "armed" : "not_met",
+          metReason: last.reason ?? null,
+          iterations: last.iterations ?? null,
+          tokensUsed: last.tokens ?? null,
+          timeUsedSeconds: typeof last.durationMs === "number" ? last.durationMs / 1000 : null,
+          updatedAtMs: Date.now(),
+        };
+      }
+    }
+
     const tailer = new TranscriptTailer(
       transcriptPath,
       (row) => this.handleTranscriptRow(sessionId, row),
@@ -2379,80 +2504,96 @@ export class ClaudeAcpAgent implements Agent {
     const now = Date.now();
     const durationSeconds =
       typeof goalStatus.durationMs === "number" ? goalStatus.durationMs / 1000 : null;
-    this.logger.log(`[anyharness] transcript goal_status row: ${safeJson(goalStatus)}`);
+    const objective = goalStatus.condition ?? ah.goal?.objective ?? "";
+    const kind = classifyGoalStatus(goalStatus);
+    this.logger.log(`[anyharness] transcript goal_status row (${kind}): ${safeJson(goalStatus)}`);
 
-    if (goalStatus.sentinel) {
-      // Arming marker (not an evaluation).
-      const objective = goalStatus.condition ?? ah.goal?.objective ?? "";
-      const alreadyAnnounced = ah.goalArmAnnounced === objective && ah.goal?.status === "active";
-      ah.goal = {
-        objective,
-        status: "active",
-        nativeStatus: "armed",
-        metReason: null,
-        iterations: goalStatus.iterations ?? ah.goal?.iterations ?? null,
-        tokensUsed: goalStatus.tokens ?? null,
-        timeUsedSeconds: durationSeconds,
-        updatedAtMs: now,
-      };
-      ah.goalArmAnnounced = objective;
-      if (!alreadyAnnounced) {
-        // Native-origin arm (e.g. the user typed /goal themselves).
+    switch (kind) {
+      case "armed": {
+        ah.goal = {
+          objective,
+          status: "active",
+          nativeStatus: "armed",
+          metReason: null,
+          iterations: goalStatus.iterations ?? null,
+          tokensUsed: goalStatus.tokens ?? null,
+          timeUsedSeconds: durationSeconds,
+          updatedAtMs: now,
+        };
         void this.sendAnyharnessEvent(sessionId, "goal_updated", {
           goal: goalWireFromState(ah.goal),
         });
+        break;
       }
-      return;
+      case "cleared": {
+        ah.goal = {
+          objective,
+          status: "cleared",
+          nativeStatus: "cleared",
+          metReason: null,
+          iterations: goalStatus.iterations ?? ah.goal?.iterations ?? null,
+          tokensUsed: goalStatus.tokens ?? ah.goal?.tokensUsed ?? null,
+          timeUsedSeconds: durationSeconds ?? ah.goal?.timeUsedSeconds ?? null,
+          updatedAtMs: now,
+        };
+        void this.sendAnyharnessEvent(sessionId, "goal_cleared", {});
+        break;
+      }
+      case "met": {
+        ah.goal = {
+          objective,
+          status: "met",
+          nativeStatus: "met",
+          metReason: goalStatus.reason ?? null,
+          iterations: goalStatus.iterations ?? null,
+          tokensUsed: goalStatus.tokens ?? null,
+          timeUsedSeconds: durationSeconds,
+          updatedAtMs: now,
+        };
+        void this.sendAnyharnessEvent(sessionId, "goal_met", { goal: goalWireFromState(ah.goal) });
+        break;
+      }
+      case "failed": {
+        ah.goal = {
+          objective,
+          status: "failed",
+          nativeStatus: "failed",
+          metReason: goalStatus.reason ?? null,
+          iterations: goalStatus.iterations ?? null,
+          tokensUsed: goalStatus.tokens ?? null,
+          timeUsedSeconds: durationSeconds,
+          updatedAtMs: now,
+        };
+        void this.sendAnyharnessEvent(sessionId, "goal_updated", {
+          goal: goalWireFromState(ah.goal),
+        });
+        break;
+      }
+      case "progress": {
+        // Evaluation that did not meet the goal — progress update.
+        ah.goal = {
+          objective,
+          status: "active",
+          nativeStatus: "not_met",
+          metReason: goalStatus.reason ?? null,
+          iterations: goalStatus.iterations ?? null,
+          tokensUsed: goalStatus.tokens ?? null,
+          timeUsedSeconds: durationSeconds,
+          updatedAtMs: now,
+        };
+        void this.sendAnyharnessEvent(sessionId, "goal_updated", {
+          goal: goalWireFromState(ah.goal),
+        });
+        break;
+      }
+      default:
+        unreachable(kind, this.logger);
+        break;
     }
 
-    const objective = goalStatus.condition ?? ah.goal?.objective ?? "";
-    if (goalStatus.met) {
-      ah.goal = {
-        objective,
-        status: "met",
-        nativeStatus: "met",
-        metReason: goalStatus.reason ?? null,
-        iterations: goalStatus.iterations ?? null,
-        tokensUsed: goalStatus.tokens ?? null,
-        timeUsedSeconds: durationSeconds,
-        updatedAtMs: now,
-      };
-      ah.goalArmAnnounced = null; // the native goal auto-clears once met
-      void this.sendAnyharnessEvent(sessionId, "goal_met", { goal: goalWireFromState(ah.goal) });
-      return;
+    for (const watcher of [...ah.goalRowWatchers]) {
+      watcher(goalStatus);
     }
-
-    if (goalStatus.failed) {
-      ah.goal = {
-        objective,
-        status: "failed",
-        nativeStatus: "failed",
-        metReason: goalStatus.reason ?? null,
-        iterations: goalStatus.iterations ?? null,
-        tokensUsed: goalStatus.tokens ?? null,
-        timeUsedSeconds: durationSeconds,
-        updatedAtMs: now,
-      };
-      void this.sendAnyharnessEvent(sessionId, "goal_updated", {
-        goal: goalWireFromState(ah.goal),
-      });
-      return;
-    }
-
-    // Evaluation that did not meet the goal — progress update.
-    ah.goal = {
-      objective,
-      status: "active",
-      nativeStatus: "not_met",
-      metReason: goalStatus.reason ?? null,
-      iterations: goalStatus.iterations ?? null,
-      tokensUsed: goalStatus.tokens ?? null,
-      timeUsedSeconds: durationSeconds,
-      updatedAtMs: now,
-    };
-    void this.sendAnyharnessEvent(sessionId, "goal_updated", {
-      goal: goalWireFromState(ah.goal),
-    });
   }
 
   async cancel(params: CancelNotification): Promise<void> {
