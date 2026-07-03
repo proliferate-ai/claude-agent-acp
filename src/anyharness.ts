@@ -165,15 +165,16 @@ export function processWireFromState(state: ProcessState): ProcessWire {
 
 /**
  * An injection (a `/goal …` / `/loop …` user message we push) that is held
- * until the session reaches a turn boundary. `/goal` is a local command that
- * silently degrades to a never-executing queued prompt when it arrives while a
- * turn is streaming, so we queue it and inject at idle — the confirmation clock
- * only starts once `onInjected` fires.
+ * until the session reaches a turn boundary. `/goal` and `/loop` are local
+ * commands that silently degrade to never-executing queued prompts when they
+ * arrive while a turn is streaming, so we queue them and inject at idle. The
+ * deferred goal/loop set methods return a provisional response immediately and
+ * carry NO fork-side confirmation wait — the mirror reconciles from the later
+ * transcript sentinel (goal) or CronCreate (loop) notification.
  */
 export type DeferredInjection = {
   uuid: string;
   text: string;
-  onInjected?: () => void;
 };
 
 /** Per-session goal/loop bookkeeping, attached to the ACP Session. */

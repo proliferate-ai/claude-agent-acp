@@ -2124,21 +2124,16 @@ export class ClaudeAcpAgent implements Agent {
    * `deferredInjections` and flushed at the next turn boundary. This is the goal
    * deferral fix: a `/goal` local command sent while a turn is streaming
    * silently degrades to a never-executing queued prompt (the 30s-timeout bug),
-   * so we hold it until idle. `onInjected` fires the instant the message is
-   * pushed — callers start their native-confirmation clock there, so it can
-   * never elapse during the preceding turn. The uuid is remembered so the drain
-   * loop can tell these turns apart from native cron wakes and keep their
-   * replays out of the client feed.
+   * so we hold it until idle. The deferred goal/loop set methods return a
+   * provisional response immediately with NO fork-side confirmation wait — the
+   * mirror reconciles from the later notification, so no clock can elapse during
+   * the preceding turn. The uuid is remembered so the drain loop can tell these
+   * turns apart from native cron wakes and keep their replays out of the feed.
    */
-  private enqueueInjectedInstruction(
-    sessionId: string,
-    session: Session,
-    text: string,
-    onInjected?: () => void,
-  ): void {
+  private enqueueInjectedInstruction(sessionId: string, session: Session, text: string): void {
     const uuid = randomUUID();
     session.anyharness.injectedUuids.add(uuid);
-    session.anyharness.deferredInjections.push({ uuid, text, onInjected });
+    session.anyharness.deferredInjections.push({ uuid, text });
     this.tryFlushDeferredInjections(sessionId);
   }
 
@@ -2171,7 +2166,6 @@ export class ClaudeAcpAgent implements Agent {
         uuid: injection.uuid as SDKUserMessage["uuid"],
       };
       session.input.push(message);
-      injection.onInjected?.();
     }
     // Ensure something drains the resulting turn when no prompt is active.
     this.startIdlePump(sessionId);
