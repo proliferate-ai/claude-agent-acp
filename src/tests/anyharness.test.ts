@@ -564,4 +564,153 @@ describe("extMethod dispatch", () => {
       cachedWriteTokens: 0,
     });
   });
+
+  // Resolves the drain (500ms budget) or reports the wedge so the assertion
+  // shows a clear diff instead of the whole suite timing out.
+  const drainOrHang = (agent: ClaudeAcpAgent, params: unknown): Promise<unknown> =>
+    Promise.race([
+      drainTurn(agent, params),
+      new Promise((resolve) => setTimeout(() => resolve("HANG"), 500)),
+    ]);
+
+  it("resolves the drain when an interrupt lands mid prompt-turn (no wedge, stopReason cancelled)", async () => {
+    const { agent } = createAgent();
+    const session = injectSession(agent, "s1");
+    const promptUuid = "prompt-uuid-1";
+
+    // Faithful ordering of the live wedge (goal met -> idle pump blocked on
+    // next() -> user prompt "nice" arrives -> pump hands off its in-flight
+    // next(), so this prompt drain starts in pre-turn mode, inOwnTurn=false):
+    //   0: assistant streams a first chunk ("An").
+    //   1: a client cancel lands here — cancel() sets session.cancelled and
+    //      calls query.interrupt(); the CLI records "[Request interrupted by
+    //      user]".
+    //   1: the prompt's own user-message replay. A cancelled turn short-circuits
+    //      before the uuid match, so inOwnTurn never flips to true.
+    //   2: result (interrupted).
+    //   3: session_state idle — the CLI is now idle and emits nothing further.
+    const messages: any[] = [
+      {
+        type: "assistant",
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "assistant", model: "claude", content: [{ type: "text", text: "An" }] },
+      },
+      {
+        type: "user",
+        uuid: promptUuid,
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "user", content: "nice" },
+      },
+      resultMsg(5, 2),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+    ];
+    let i = 0;
+    const interrupt = vi.fn(async () => {});
+    session.query = {
+      next: async () => {
+        // The interrupt lands right after the first chunk streamed, before the
+        // prompt's own replay is drained.
+        if (i === 1) session.cancelled = true;
+        if (i < messages.length) return { done: false, value: messages[i++] };
+        // After acknowledging the interrupt the CLI is idle: next() never
+        // resolves again — exactly what wedged prompt() for 135s in the wild.
+        return new Promise<never>(() => {});
+      },
+      interrupt,
+    } as any;
+    // Idle-pump handoff: the in-flight next() sits on the session, which is the
+    // signal that puts the prompt drain into pre-turn mode (inOwnTurn=false).
+    session.pendingQueryNext = session.query.next();
+
+    const outcome = await drainOrHang(agent, {
+      sessionId: "s1",
+      session,
+      owner: "prompt",
+      promptUuid,
+    });
+    expect(outcome).not.toBe("HANG");
+    expect(outcome).toEqual({ kind: "turn_ended", stopReason: "cancelled" });
+  });
+
+  it("ends a cancelled prompt drain on the next idle even with no trailing result", async () => {
+    const { agent } = createAgent();
+    const session = injectSession(agent, "s1");
+    session.cancelled = true;
+    let served = false;
+    session.query = {
+      next: async () => {
+        if (!served) {
+          served = true;
+          return {
+            done: false,
+            value: {
+              type: "system",
+              subtype: "session_state_changed",
+              state: "idle",
+              session_id: "s1",
+            },
+          };
+        }
+        return new Promise<never>(() => {});
+      },
+    } as any;
+    // Pre-turn mode + already cancelled: the interrupt was acknowledged and the
+    // CLI emits only idle (no trailing result). The drain must resolve rather
+    // than block forever on the next next().
+    session.pendingQueryNext = session.query.next();
+
+    const outcome = await drainOrHang(agent, {
+      sessionId: "s1",
+      session,
+      owner: "prompt",
+      promptUuid: "p1",
+    });
+    expect(outcome).toEqual({ kind: "turn_ended", stopReason: "cancelled" });
+  });
+
+  it("a normal prompt handed off by the idle pump streams to completion without a self-interrupt", async () => {
+    const { agent } = createAgent();
+    const session = injectSession(agent, "s1");
+    const promptUuid = "prompt-uuid-1";
+    const interrupt = vi.fn(async () => {});
+    // No cron wake ahead: the handed-off stream is the prompt's OWN turn.
+    const base = queryFrom([
+      {
+        type: "user",
+        uuid: promptUuid,
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "user", content: "nice" },
+      },
+      {
+        type: "assistant",
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "assistant", model: "claude", content: [{ type: "text", text: "An" }] },
+      },
+      resultMsg(5, 2),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+    ]);
+    session.query = { next: base.next, interrupt } as any;
+    // Idle-pump handoff: pre-turn mode (inOwnTurn=false).
+    session.pendingQueryNext = session.query.next();
+
+    const outcome = await drainOrHang(agent, {
+      sessionId: "s1",
+      session,
+      owner: "prompt",
+      promptUuid,
+    });
+    expect(outcome).toEqual({ kind: "turn_ended", stopReason: "end_turn" });
+    // A normal prompt turn must never trigger an interrupt of its own turn.
+    expect(interrupt).not.toHaveBeenCalled();
+    expect(session.accumulatedUsage).toEqual({
+      inputTokens: 5,
+      outputTokens: 2,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    });
+  });
 });
