@@ -124,12 +124,6 @@ export type ProcessState = ProcessWire & {
 
 export type SubagentStatus = "running" | "completed" | "failed";
 
-export type ActivityUsage = {
-  totalTokens: number;
-  toolUses: number;
-  durationMs: number;
-};
-
 /** Normalized wire record for a subagent (Claude `local_agent` task). */
 export type SubagentWire = {
   id: string; // claude task_id (doubles as SendMessage agent id)
@@ -140,7 +134,13 @@ export type SubagentWire = {
   background: boolean;
   status: SubagentStatus;
   summary: string | null;
-  usage: ActivityUsage | null; // from task_progress / task_notification
+  // Usage as FLAT sibling fields (from task_progress / task_notification),
+  // matching anyharness's ActivitySubagentWire contract. Nesting these under a
+  // `usage` object (or naming/uniting them differently) makes the runtime read
+  // them as absent, so the roster UI shows no usage. Seconds, not milliseconds.
+  tokensUsed: number | null;
+  toolCalls: number | null;
+  durationSeconds: number | null;
   feed: FeedTransport | null; // tail_file(<parent>/subagents/agent-<id>.jsonl)
   updatedAtMs: number;
 };

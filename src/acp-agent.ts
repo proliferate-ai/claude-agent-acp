@@ -1955,11 +1955,15 @@ export class ClaudeAcpAgent implements Agent {
       if (!taskId) {
         return;
       }
+      // Flat usage fields matching the ActivitySubagentWire contract (seconds,
+      // not milliseconds). Nesting them or using different names makes the
+      // runtime read them as absent.
       const usage = event.usage
         ? {
-            totalTokens: event.usage.total_tokens,
-            toolUses: event.usage.tool_uses,
-            durationMs: event.usage.duration_ms,
+            tokensUsed: event.usage.total_tokens,
+            toolCalls: event.usage.tool_uses,
+            durationSeconds:
+              typeof event.usage.duration_ms === "number" ? event.usage.duration_ms / 1000 : null,
           }
         : null;
       const outputFile = typeof event.output_file === "string" ? event.output_file : null;
@@ -1975,7 +1979,9 @@ export class ClaudeAcpAgent implements Agent {
             background: true,
             status: "running",
             summary: null,
-            usage: null,
+            tokensUsed: null,
+            toolCalls: null,
+            durationSeconds: null,
             // The per-agent transcript exists from spawn — open a live feed now.
             feed: {
               transport: "tail_file",
@@ -2013,7 +2019,7 @@ export class ClaudeAcpAgent implements Agent {
         const subagent = ah.subagents.get(taskId);
         if (subagent) {
           if (usage) {
-            subagent.usage = usage;
+            Object.assign(subagent, usage);
           }
           if (event.summary) {
             subagent.summary = event.summary;
@@ -2033,7 +2039,7 @@ export class ClaudeAcpAgent implements Agent {
           subagent.summary = event.summary;
         }
         if (usage) {
-          subagent.usage = usage;
+          Object.assign(subagent, usage);
         }
         if (outputFile) {
           subagent.feed = { transport: "tail_file", path: outputFile };

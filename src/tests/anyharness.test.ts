@@ -1233,11 +1233,23 @@ describe("extMethod dispatch", () => {
         task_id: "a1",
         usage: { total_tokens: 1200, tool_uses: 4, duration_ms: 8000 },
       });
-      expect(session.anyharness.subagents.get("a1")?.usage).toEqual({
-        totalTokens: 1200,
-        toolUses: 4,
-        durationMs: 8000,
+      // Usage is stored as FLAT sibling fields (seconds, not ms) — the shape the
+      // ActivitySubagentWire contract deserializes. A nested `usage` object would
+      // make the runtime read them as absent.
+      const stored = session.anyharness.subagents.get("a1") as unknown as Record<string, unknown>;
+      expect(stored.tokensUsed).toBe(1200);
+      expect(stored.toolCalls).toBe(4);
+      expect(stored.durationSeconds).toBe(8);
+      expect("usage" in stored).toBe(false);
+      // The emitted wire payload carries the same flat fields.
+      const progressEvents = anyharnessEvents(updates);
+      const progressEvent = progressEvents[progressEvents.length - 1];
+      expect(progressEvent.subagent).toMatchObject({
+        tokensUsed: 1200,
+        toolCalls: 4,
+        durationSeconds: 8,
       });
+      expect("usage" in (progressEvent.subagent ?? {})).toBe(false);
       await call(agent, "handleTaskEvent", "s1", {
         type: "system",
         subtype: "task_notification",
