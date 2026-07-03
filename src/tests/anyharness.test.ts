@@ -348,6 +348,26 @@ describe("parseBackgroundOutputFile", () => {
     expect(parseBackgroundOutputFile("logs — output: /var/log/x.txt.")).toBe("/var/log/x.txt");
   });
 
+  it("parses the real Claude Code 2.1.199 background-Bash result phrasing", () => {
+    // Live-captured wire (haiku probe): the real result says "Output is being
+    // written to: <path>", which the old `/output\s*(?:→|->|:)/` regex missed,
+    // so the process feed shipped as null (gate B FeedRef FAIL).
+    expect(
+      parseBackgroundOutputFile(
+        "Command running in background with ID: b5vllnrel. Output is being written to: /tmp/probe/706962/tasks/b5vllnrel.output",
+      ),
+    ).toBe("/tmp/probe/706962/tasks/b5vllnrel.output");
+    // Same phrasing as an array-of-blocks tool_result body.
+    expect(
+      parseBackgroundOutputFile([
+        {
+          type: "text",
+          text: "Command running in background with ID: x. Output is being written to: /var/tasks/x.output",
+        },
+      ]),
+    ).toBe("/var/tasks/x.output");
+  });
+
   it("parses from an array-of-blocks tool_result body", () => {
     expect(
       parseBackgroundOutputFile([{ type: "text", text: "running, output -> /tmp/a.log" }]),
@@ -357,6 +377,8 @@ describe("parseBackgroundOutputFile", () => {
   it("returns null when no output path is present", () => {
     expect(parseBackgroundOutputFile("done")).toBeNull();
     expect(parseBackgroundOutputFile(null)).toBeNull();
+    // A background-launch line with no path at all still yields null.
+    expect(parseBackgroundOutputFile("Command running in background with ID: t1")).toBeNull();
   });
 });
 
@@ -1153,6 +1175,47 @@ describe("extMethod dispatch", () => {
         path: "/tmp/out.log",
       });
       // The feed discovery re-emits process_upserted so the runtime can attach.
+      const feedEvents = anyharnessEvents(updates).filter(
+        (e) => e.transcriptEvent === "process_upserted" && e.process?.feed,
+      );
+      expect(feedEvents).toHaveLength(1);
+    });
+
+    it("materializes the live-tail feed from the REAL Claude Code background-Bash result phrasing", async () => {
+      // Regression for gate B "process roster element carries a live-tail
+      // FeedRef" FAIL: the real result is "Output is being written to: <path>",
+      // which the old parser missed — so the process shipped feed:null.
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      await call(agent, "handleTaskEvent", "s1", {
+        type: "system",
+        subtype: "task_started",
+        task_id: "t1",
+        tool_use_id: "tu1",
+        task_type: "local_bash",
+        description: "run",
+      });
+      expect(session.anyharness.processes.get("t1")?.feed).toBeNull();
+
+      call(agent, "captureTaskIo", "s1", {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu1",
+              content:
+                "Command running in background with ID: t1. Output is being written to: /tmp/tasks/t1.output. You will be notified when it completes.",
+            },
+          ],
+        },
+      });
+
+      expect(session.anyharness.processes.get("t1")?.feed).toEqual({
+        transport: "tail_file",
+        path: "/tmp/tasks/t1.output",
+      });
       const feedEvents = anyharnessEvents(updates).filter(
         (e) => e.transcriptEvent === "process_upserted" && e.process?.feed,
       );

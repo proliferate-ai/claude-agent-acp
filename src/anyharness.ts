@@ -504,9 +504,16 @@ export function subagentFeedPath(
 }
 
 /**
- * Parses the output-file path out of a background-bash tool_result body
- * ("Command running in background with ID: …, output → <file>"), so the process
- * feed can tail it live rather than waiting for the completion notification.
+ * Parses the output-file path out of a background-bash tool_result body, so the
+ * process feed can tail it live rather than waiting for the completion
+ * notification. Live-verified against Claude Code 2.1.199, whose real
+ * background-Bash result is:
+ *   "Command running in background with ID: <id>. Output is being written to: <path>"
+ * The old `/output\s*(?:→|->|:)/` pattern did NOT match "Output is being written
+ * to:" (there is no colon/arrow directly after "output"), so the output file was
+ * never captured and the process roster element shipped with `feed: null` (gate
+ * B "carries a live-tail FeedRef" FAIL). We now also match the "written to:" /
+ * "logs to" phrasings while keeping the legacy "output → <path>" forms.
  */
 export function parseBackgroundOutputFile(toolResult: unknown): string | null {
   const text =
@@ -528,10 +535,19 @@ export function parseBackgroundOutputFile(toolResult: unknown): string | null {
   if (!text) {
     return null;
   }
-  // "output → /path", "output: /path", "output file: /path", "logs to /path"
-  const arrow = text.match(/output\s*(?:→|->|:)\s*(\S+)/i);
-  if (arrow?.[1]) {
-    return arrow[1].replace(/[.,)]+$/, "");
+  const patterns = [
+    // Claude Code background Bash: "…Output is being written to: <path>".
+    /(?:written|writing|logged|logging)\s+to:?\s*(\S+)/i,
+    // "logs to /path", "logging to /path".
+    /logs?\s+to:?\s*(\S+)/i,
+    // Legacy forms: "output → /path", "output: /path", "output file: /path".
+    /output(?:\s+file)?\s*(?:→|->|:)\s*(\S+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return match[1].replace(/[.,)]+$/, "");
+    }
   }
   return null;
 }
