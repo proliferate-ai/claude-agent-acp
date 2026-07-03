@@ -536,5 +536,32 @@ describe("extMethod dispatch", () => {
     expect(loopFired).toHaveLength(1);
     expect(loopFired[0]!.loopId).toBe("loop-1");
     expect(session.anyharness.loops.get("loop-1")?.fireCount).toBe(1);
+
+    // The wake pre-turn's 100/50 usage must NOT pollute the prompt's own 7/3.
+    expect(session.accumulatedUsage).toEqual({
+      inputTokens: 7,
+      outputTokens: 3,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    });
+  });
+
+  it("does not fold an idle-pump turn's usage into accumulatedUsage", async () => {
+    const { agent } = createAgent();
+    const session = injectSession(agent, "s1");
+    session.query = queryFrom([
+      { type: "system", subtype: "init", session_id: "s1" },
+      resultMsg(100, 50),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+    ]);
+
+    const outcome = await drainTurn(agent, { sessionId: "s1", session, owner: "pump" });
+    expect(outcome).toEqual({ kind: "turn_ended", stopReason: "end_turn" });
+    expect(session.accumulatedUsage).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    });
   });
 });

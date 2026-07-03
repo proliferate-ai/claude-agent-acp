@@ -622,12 +622,6 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     session.cancelled = false;
-    session.accumulatedUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedReadTokens: 0,
-      cachedWriteTokens: 0,
-    };
 
     const userMessage = promptToClaude(params);
 
@@ -660,6 +654,18 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     session.promptRunning = true;
+    // Reset usage accounting only now that this prompt owns the stream — never
+    // at the top of prompt(), where it could zero a still-running idle pump
+    // turn's or a concurrently-queued prompt's in-flight accumulation. The
+    // idle pump and the spontaneous pre-turns a handed-off drain sees first
+    // never write session.accumulatedUsage (see drainTurn), so from here it
+    // reflects only this prompt's own turn(s).
+    session.accumulatedUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    };
     let handedOff = false;
 
     try {
@@ -943,11 +949,17 @@ export class ClaudeAcpAgent implements Agent {
           break;
         }
         case "result": {
-          // Accumulate usage from this result
-          session.accumulatedUsage.inputTokens += message.usage.input_tokens;
-          session.accumulatedUsage.outputTokens += message.usage.output_tokens;
-          session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
-          session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
+          // Accumulate usage only for the turn(s) this prompt() call reports.
+          // The idle pump (owner "pump") and the spontaneous cron-wake /
+          // injected pre-turns a handed-off prompt drains before its own turn
+          // (inOwnTurn still false) must not pollute the usage returned to the
+          // prompt() caller. (inOwnTurn is only ever true for owner "prompt".)
+          if (inOwnTurn) {
+            session.accumulatedUsage.inputTokens += message.usage.input_tokens;
+            session.accumulatedUsage.outputTokens += message.usage.output_tokens;
+            session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
+            session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
+          }
 
           // Calculate context window size from modelUsage (minimum across all models used)
           const contextWindows = Object.values(message.modelUsage).map((m) => m.contextWindow);
