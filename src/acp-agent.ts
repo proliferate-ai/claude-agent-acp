@@ -92,6 +92,7 @@ import {
   ProcessState,
   ProcessWire,
   processWireFromState,
+  readArmedLoopsFromTranscript,
   readLastGoalStatus,
   reconcileSessionCrons,
   subagentFeedPath,
@@ -2272,6 +2273,22 @@ export class ClaudeAcpAgent implements Agent {
           timeUsedSeconds: typeof last.durationMs === "number" ? last.durationMs / 1000 : null,
           updatedAtMs: Date.now(),
         };
+      }
+    }
+
+    if (!ah.tailFromStart && ah.loops.size === 0) {
+      // Same story for loops: a resumed/forked session tails from EOF, and
+      // session_crons (the reconcile snapshot) is never delivered — so seed the
+      // loop mirror from the crons still armed at the end of the transcript. Each
+      // seeded loop is emitted as loop_upserted so the reattached client renders
+      // it (the loop-roster port's mirror-is-the-source-of-truth invariant).
+      const seeded = readArmedLoopsFromTranscript(transcriptPath, Date.now());
+      for (const loop of seeded) {
+        ah.loops.set(loop.loopId, loop);
+        void this.sendAnyharnessEvent(sessionId, "loop_upserted", {
+          loop: loopWireFromState(loop),
+          loopId: loop.loopId,
+        });
       }
     }
 

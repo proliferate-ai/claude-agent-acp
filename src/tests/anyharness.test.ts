@@ -16,6 +16,7 @@ import {
   newAnyharnessSessionState,
   parseBackgroundOutputFile,
   parseCronIdFromResult,
+  readArmedLoopsFromTranscript,
   readLastGoalStatus,
   reconcileSessionCrons,
   subagentFeedPath,
@@ -427,6 +428,103 @@ describe("extractCronFirePrompt", () => {
     ).toBeNull();
     expect(extractCronFirePrompt({ type: "assistant" })).toBeNull();
     expect(extractCronFirePrompt(null)).toBeNull();
+  });
+});
+
+describe("readArmedLoopsFromTranscript", () => {
+  function writeTranscript(lines: unknown[]): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "anyharness-loopseed-"));
+    const file = path.join(dir, "session.jsonl");
+    fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    return file;
+  }
+  const cronCreate = (toolUseId: string, cron: string, prompt: string, recurring: unknown) => ({
+    type: "assistant",
+    message: {
+      role: "assistant",
+      content: [{ type: "tool_use", id: toolUseId, name: "CronCreate", input: { cron, prompt, recurring } }],
+    },
+  });
+  const cronCreateResult = (toolUseId: string, id: string) => ({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseId,
+          content: `Scheduled recurring job ${id} (Every minute). Session-only. Use CronDelete to cancel.`,
+        },
+      ],
+    },
+    toolUseResult: { id, humanSchedule: "Every minute", recurring: true, durable: false },
+  });
+  const cronFire = (prompt: string) => ({
+    type: "user",
+    isMeta: true,
+    message: { role: "user", content: prompt },
+  });
+
+  it("reconstructs a still-armed loop with the real cron id and recovered fire count", () => {
+    const file = writeTranscript([
+      cronCreate("tu-1", "*/1 * * * *", "append PING", true),
+      cronCreateResult("tu-1", "abc123"),
+      cronFire("append PING"),
+      cronFire("append PING"),
+    ]);
+    const loops = readArmedLoopsFromTranscript(file, 1000);
+    expect(loops).toHaveLength(1);
+    expect(loops[0]).toMatchObject({
+      loopId: "abc123",
+      prompt: "append PING",
+      schedule: { kind: "cron", expr: "*/1 * * * *" },
+      recurring: true,
+      status: "active",
+      fireCount: 2,
+    });
+  });
+
+  it("honors a confirmed CronDelete so a removed loop is not resurrected", () => {
+    const file = writeTranscript([
+      cronCreate("tu-1", "*/1 * * * *", "append PING", true),
+      cronCreateResult("tu-1", "abc123"),
+      cronFire("append PING"),
+      // CronDelete abc123, confirmed.
+      {
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tu-2", name: "CronDelete", input: { id: "abc123" } }],
+        },
+      },
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "tu-2", content: "Cancelled job abc123." }],
+        },
+      },
+    ]);
+    expect(readArmedLoopsFromTranscript(file, 1000)).toEqual([]);
+  });
+
+  it("coerces a string 'recurring' and keeps the latest of two armed loops", () => {
+    const file = writeTranscript([
+      cronCreate("tu-1", "0 * * * *", "hourly job", "true"),
+      cronCreateResult("tu-1", "hourly1"),
+      cronCreate("tu-2", "*/5 * * * *", "five-min job", false),
+      cronCreateResult("tu-2", "fivemin1"),
+    ]);
+    const loops = readArmedLoopsFromTranscript(file, 1000).sort((a, b) =>
+      a.loopId.localeCompare(b.loopId),
+    );
+    expect(loops.map((l) => l.loopId)).toEqual(["fivemin1", "hourly1"]);
+    expect(loops.find((l) => l.loopId === "hourly1")?.recurring).toBe(true);
+    expect(loops.find((l) => l.loopId === "fivemin1")?.recurring).toBe(false);
+  });
+
+  it("returns [] for a missing transcript", () => {
+    expect(readArmedLoopsFromTranscript("/no/such/file.jsonl", 1000)).toEqual([]);
   });
 });
 
@@ -1447,6 +1545,65 @@ describe("extMethod dispatch", () => {
 
       expect(loopFiredEvents(updates)).toHaveLength(0);
       expect(session.anyharness.loops.get("loop-1")?.fireCount).toBe(0);
+    });
+  });
+
+  describe("loop mirror seeding on resume", () => {
+    const flush = () => new Promise((r) => setTimeout(r, 0));
+
+    it("seeds armed loops from the transcript for a resumed session and emits loop_upserted", async () => {
+      const { agent, updates } = createAgent();
+      const transcriptPath = tempTranscript();
+      fs.writeFileSync(
+        transcriptPath,
+        [
+          {
+            type: "assistant",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "tu-1",
+                  name: "CronCreate",
+                  input: { cron: "*/1 * * * *", prompt: "append PING", recurring: true },
+                },
+              ],
+            },
+          },
+          {
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                { type: "tool_result", tool_use_id: "tu-1", content: "Scheduled recurring job abc123." },
+              ],
+            },
+            toolUseResult: { id: "abc123", durable: false },
+          },
+          { type: "user", isMeta: true, message: { role: "user", content: "append PING" } },
+        ]
+          .map((l) => JSON.stringify(l))
+          .join("\n") + "\n",
+      );
+
+      const session = injectSession(agent, "s1", transcriptPath);
+      // Resumed/forked sessions tail from EOF and get no session_crons snapshot.
+      session.anyharness.tailFromStart = false;
+      expect(session.anyharness.loops.size).toBe(0);
+
+      call(agent, "ensureTranscriptTailer", "s1", session);
+      await flush();
+
+      const loop = session.anyharness.loops.get("abc123");
+      expect(loop).toMatchObject({ loopId: "abc123", prompt: "append PING", status: "active" });
+      expect(loop?.fireCount).toBe(1);
+      const upserts = anyharnessEvents(updates).filter(
+        (e) => e.transcriptEvent === "loop_upserted",
+      );
+      expect(upserts.map((e) => e.loop?.loopId)).toContain("abc123");
+
+      session.anyharness.tailer?.dispose();
     });
   });
 

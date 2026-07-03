@@ -704,6 +704,155 @@ export function readLastGoalStatus(filePath: string): GoalStatusRow | null {
   return last;
 }
 
+/** Coerces a CronCreate/CronList `recurring` field (bool OR the string "true"). */
+function coerceRecurring(value: unknown): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    return value.trim().toLowerCase() !== "false";
+  }
+  return true;
+}
+
+/** True when a tool_result content string reports a cancelled/deleted cron. */
+function isCronDeleteConfirmation(content: unknown): boolean {
+  const text = toolResponseText(content);
+  return /\b(cancell?ed|deleted|removed)\b/i.test(text) && !/\berror\b/i.test(text);
+}
+
+/**
+ * Reconstructs the loops still armed at the end of a transcript, for seeding the
+ * loop mirror on `--resume`/fork — the loop analog of {@link readLastGoalStatus}
+ * for goals. A resumed session tails from EOF, so without this seed the mirror
+ * starts empty and a loop armed before the resume is never reflected (gate C
+ * "resume → loop re-arms and fires again" FAIL). `session_crons` — the hook
+ * snapshot the reconcile path was built around — is NOT present on resume (nor
+ * on any hook, live-verified 2.1.199), so the transcript is the only source.
+ *
+ * Replays the native cron tool history in order: each confirmed `CronCreate`
+ * arms a loop under the id its result reports; each confirmed `CronDelete`
+ * removes it. Fire bookkeeping is recovered by counting the dequeued cron-prompt
+ * rows (see {@link extractCronFirePrompt}) that match each armed loop's prompt.
+ *
+ * NOTE: Claude session-only crons ("dies when Claude exits") do not survive the
+ * native process across a resume; this seed reflects the last-known armed state
+ * so the client can observe/clear/re-arm from it, rather than silently dropping
+ * the loops off the mirror.
+ */
+export function readArmedLoopsFromTranscript(filePath: string, now: number): LoopState[] {
+  let text: string;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+
+  const armed = new Map<string, LoopState>();
+  // tool_use id -> the CronCreate input awaiting its result (which carries the id)
+  const pendingCreate = new Map<string, { expr: string; prompt: string; recurring: boolean }>();
+  // tool_use id -> the CronDelete target id awaiting its (success) result
+  const pendingDelete = new Map<string, string | undefined>();
+  const fireCountsByPrompt = new Map<string, number>();
+
+  const contentBlocks = (row: { message?: { content?: unknown } }): Record<string, unknown>[] => {
+    const content = row.message?.content;
+    return Array.isArray(content)
+      ? content.filter((b): b is Record<string, unknown> => typeof b === "object" && b !== null)
+      : [];
+  };
+
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let row: any;
+    try {
+      row = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+
+    if (row.type === "assistant") {
+      for (const block of contentBlocks(row)) {
+        if (block.type !== "tool_use" || typeof block.id !== "string") {
+          continue;
+        }
+        const input = (block.input ?? {}) as Record<string, unknown>;
+        if (block.name === "CronCreate") {
+          pendingCreate.set(block.id, {
+            expr: typeof input.cron === "string" ? input.cron : "",
+            prompt: typeof input.prompt === "string" ? input.prompt : "",
+            recurring: coerceRecurring(input.recurring),
+          });
+        } else if (block.name === "CronDelete") {
+          pendingDelete.set(block.id, extractCronId(input));
+        }
+      }
+      continue;
+    }
+
+    if (row.type === "user") {
+      // A dequeued cron fire row (isMeta user prompt) — count it per prompt.
+      const firePrompt = extractCronFirePrompt(row);
+      if (firePrompt) {
+        fireCountsByPrompt.set(firePrompt, (fireCountsByPrompt.get(firePrompt) ?? 0) + 1);
+        continue;
+      }
+      for (const block of contentBlocks(row)) {
+        if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") {
+          continue;
+        }
+        const toolUseId = block.tool_use_id;
+        const isError = block.is_error === true;
+
+        const create = pendingCreate.get(toolUseId);
+        if (create) {
+          pendingCreate.delete(toolUseId);
+          const structuredId =
+            row.toolUseResult && typeof row.toolUseResult.id === "string"
+              ? (row.toolUseResult.id as string)
+              : null;
+          const id = structuredId ?? parseCronIdFromResult(block.content);
+          if (id && !isError) {
+            armed.set(id, {
+              loopId: id,
+              prompt: create.prompt,
+              schedule: { kind: "cron", expr: create.expr },
+              recurring: create.recurring,
+              status: "active",
+              lastFiredAtMs: null,
+              fireCount: 0,
+              updatedAtMs: now,
+            });
+          }
+          continue;
+        }
+
+        if (pendingDelete.has(toolUseId)) {
+          const target = pendingDelete.get(toolUseId);
+          pendingDelete.delete(toolUseId);
+          const confirmedId =
+            target ?? parseCronIdFromResult(block.content) ?? undefined;
+          if (!isError && confirmedId && isCronDeleteConfirmation(block.content)) {
+            armed.delete(confirmedId);
+          }
+        }
+      }
+    }
+  }
+
+  for (const loop of armed.values()) {
+    const fireCount = fireCountsByPrompt.get(loop.prompt) ?? 0;
+    if (fireCount > 0) {
+      loop.fireCount = fireCount;
+      loop.lastFiredAtMs = now;
+    }
+  }
+  return [...armed.values()];
+}
+
 const TAIL_DEBOUNCE_MS = 50;
 const TAIL_POLL_INTERVAL_MS = 750;
 
