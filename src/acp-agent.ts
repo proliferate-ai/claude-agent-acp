@@ -811,14 +811,33 @@ export class ClaudeAcpAgent implements Agent {
         const interrupted = new Promise<"interrupted">((resolve) => {
           session.anyharness.pumpInterrupt = () => resolve("interrupted");
         });
-        const winner = await Promise.race([pull, interrupted]);
+        let winner: IteratorResult<SDKMessage, void> | "interrupted";
+        try {
+          winner = await Promise.race([pull, interrupted]);
+        } catch (error) {
+          // The in-flight next() rejected. Clear it so the poisoned promise
+          // isn't re-awaited by every future drain (which would wedge the
+          // session forever); a later drain starts a fresh next().
+          session.anyharness.pumpInterrupt = null;
+          session.pendingQueryNext = null;
+          throw error;
+        }
         session.anyharness.pumpInterrupt = null;
         if (winner === "interrupted") {
+          // Leave pendingQueryNext set: the pull is still in flight and the
+          // prompt taking over will await it.
           return { kind: "handed_off" };
         }
         iteration = winner;
       } else {
-        iteration = await pull;
+        try {
+          iteration = await pull;
+        } catch (error) {
+          // See above: a rejected next() must not stay cached, or the next
+          // prompt()/pump drain re-throws the same stale error indefinitely.
+          session.pendingQueryNext = null;
+          throw error;
+        }
       }
       session.pendingQueryNext = null;
       const { value: message, done } = iteration;
