@@ -11,6 +11,7 @@ import {
   extractGoalStatus,
   isSyntheticLoopId,
   LoopState,
+  matchLoopForWake,
   newAnyharnessSessionState,
   parseBackgroundOutputFile,
   parseCronIdFromResult,
@@ -287,6 +288,34 @@ describe("isSyntheticLoopId / extractCronId", () => {
     expect(extractCronId({ jobId: 42 })).toBe("42");
     expect(extractCronId({ result: { cron_id: "c9" } })).toBe("c9");
     expect(extractCronId({ nothing: true })).toBeUndefined();
+  });
+});
+
+describe("matchLoopForWake", () => {
+  it("matches a wake to the loop whose prompt it replays exactly", () => {
+    const a = activeLoop({ loopId: "a", prompt: "check the build" });
+    const b = activeLoop({ loopId: "b", prompt: "poll the queue" });
+    expect(matchLoopForWake([a, b], "poll the queue")?.loopId).toBe("b");
+  });
+
+  it("prefers an exact match over a containment match (no cross-loop credit)", () => {
+    // "poll" is a substring of the other loop's prompt, but the exact match wins.
+    const a = activeLoop({ loopId: "a", prompt: "poll the queue" });
+    const b = activeLoop({ loopId: "b", prompt: "poll" });
+    expect(matchLoopForWake([a, b], "poll")?.loopId).toBe("b");
+  });
+
+  it("refuses to guess when the text ambiguously contains multiple loop prompts", () => {
+    const a = activeLoop({ loopId: "a", prompt: "build" });
+    const b = activeLoop({ loopId: "b", prompt: "test" });
+    // A wrapped wake prompt that contains BOTH loop prompts — attributing to
+    // either would corrupt the wrong loop's bookkeeping, so refuse.
+    expect(matchLoopForWake([a, b], "build and test the project")).toBeUndefined();
+  });
+
+  it("returns undefined when no loop prompt is related to the text", () => {
+    const a = activeLoop({ loopId: "a", prompt: "check the build" });
+    expect(matchLoopForWake([a], "unrelated goal continuation")).toBeUndefined();
   });
 });
 
@@ -893,6 +922,81 @@ describe("extMethod dispatch", () => {
       cachedReadTokens: 0,
       cachedWriteTokens: 0,
     });
+  });
+
+  const loopFiredEvents = (updates: SessionNotification[]) =>
+    updates
+      .map(
+        (u) =>
+          (u.update as { _meta?: { anyharness?: { transcriptEvent?: string; loopId?: string } } })
+            ._meta?.anyharness,
+      )
+      .filter((m) => m?.transcriptEvent === "loop_fired");
+
+  it("does not fire a loop for a spontaneous assistant turn with no matching wake prompt", async () => {
+    // A goal continuation (or a background-task wake) drains as a bare
+    // spontaneous assistant turn while a loop is armed. It carries no wake
+    // user-prompt, so it must NOT be miscounted as a loop fire.
+    const { agent, updates } = createAgent();
+    const session = injectSession(agent, "s1");
+    armLoop(session, "check the build");
+
+    session.query = queryFrom([
+      { type: "system", subtype: "init", session_id: "s1" },
+      {
+        type: "assistant",
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: {
+          role: "assistant",
+          model: "claude",
+          content: [{ type: "text", text: "continuing toward the goal" }],
+        },
+      },
+      resultMsg(40, 20),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+    ]);
+
+    const outcome = await drainTurn(agent, { sessionId: "s1", session, owner: "pump" });
+    expect(outcome).toEqual({ kind: "turn_ended", stopReason: "end_turn" });
+    expect(loopFiredEvents(updates)).toHaveLength(0);
+    expect(session.anyharness.loops.get("loop-1")?.fireCount).toBe(0);
+  });
+
+  it("credits a cron wake to the loop whose prompt it replays, not loops[0]", async () => {
+    // Two loops armed: a genuine wake for loop B must move loop B's bookkeeping,
+    // never loop A's (the old loops[0] fallback credited the wrong loop).
+    const { agent, updates } = createAgent();
+    const session = injectSession(agent, "s1");
+    session.anyharness.loops.set("loop-a", activeLoop({ loopId: "loop-a", prompt: "watch A" }));
+    session.anyharness.loops.set("loop-b", activeLoop({ loopId: "loop-b", prompt: "watch B" }));
+
+    session.query = queryFrom([
+      { type: "system", subtype: "init", session_id: "s1" },
+      {
+        type: "user",
+        uuid: "wake-b",
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "user", content: "watch B" },
+      },
+      {
+        type: "assistant",
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "assistant", model: "claude", content: [{ type: "text", text: "on it" }] },
+      },
+      resultMsg(10, 5),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+    ]);
+
+    const outcome = await drainTurn(agent, { sessionId: "s1", session, owner: "pump" });
+    expect(outcome).toEqual({ kind: "turn_ended", stopReason: "end_turn" });
+
+    const fired = loopFiredEvents(updates);
+    expect(fired.map((m) => m!.loopId)).toEqual(["loop-b"]);
+    expect(session.anyharness.loops.get("loop-b")?.fireCount).toBe(1);
+    expect(session.anyharness.loops.get("loop-a")?.fireCount).toBe(0);
   });
 
   // --- Helpers to reach the private roster / reconcile / injection paths. ---

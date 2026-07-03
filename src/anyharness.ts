@@ -266,6 +266,34 @@ export function activeLoops(state: AnyharnessSessionState): LoopState[] {
 }
 
 /**
+ * Attributes a spontaneous cron-wake turn to a specific armed loop by the
+ * user-prompt the wake replayed. A native cron wake re-injects the loop's exact
+ * prompt as a user message (and re-emits system:init); that replay is the ONLY
+ * reliable fire signal. A bare spontaneous assistant turn — a goal continuation,
+ * a background-task wake, or an ambiguous multi-loop wake — carries no such
+ * message and must never be credited as a fire.
+ *
+ * Prefers an exact prompt match; falls back to a containment match only when it
+ * is unambiguous (exactly one loop), so prompts that overlap as substrings
+ * across loops can't credit the wrong loop. Returns undefined when zero or more
+ * than one loop matches — better to under-count than to move the wrong loop's
+ * fire bookkeeping.
+ */
+export function matchLoopForWake(loops: LoopState[], userText: string): LoopState | undefined {
+  const exact = loops.filter((loop) => loop.prompt === userText);
+  if (exact.length === 1) {
+    return exact[0];
+  }
+  if (exact.length > 1) {
+    return undefined; // multiple loops share this exact prompt — ambiguous
+  }
+  const contained = loops.filter(
+    (loop) => userText.includes(loop.prompt) || loop.prompt.includes(userText),
+  );
+  return contained.length === 1 ? contained[0] : undefined;
+}
+
+/**
  * A loop id we synthesized ourselves (CronCreate returned no id, or loop/set
  * timed out) rather than a real harness cron id. These are replaced by a real
  * id when a session_crons snapshot reveals one for the same prompt.

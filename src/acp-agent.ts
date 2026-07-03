@@ -83,6 +83,7 @@ import {
   LoopState,
   LoopWire,
   loopWireFromState,
+  matchLoopForWake,
   newAnyharnessSessionState,
   parseBackgroundOutputFile,
   parseCronIdFromResult,
@@ -838,21 +839,26 @@ export class ClaudeAcpAgent implements Agent {
         turnKind = "plain";
         return;
       }
-      let loop: LoopState | undefined;
-      if (userText) {
-        loop = loops.find((l) => userText.includes(l.prompt) || l.prompt.includes(userText));
-        if (!loop) {
-          // A user message matching no armed loop prompt isn't enough
-          // evidence of a wake — wait for assistant activity.
-          return;
-        }
-      } else {
-        loop = loops[0];
-        if (loops.length > 1) {
-          this.logger.error(
-            `[anyharness] ambiguous cron wake (${loops.length} loops armed); attributing to ${loop.loopId}`,
-          );
-        }
+      if (!userText) {
+        // A bare spontaneous assistant turn with no wake user-prompt in front of
+        // it is NOT evidence of a specific loop fire: it may be a goal
+        // continuation, a background-task wake, or a wake whose prompt didn't
+        // match. Crediting loops[0] here corrupts fireCount and streams a
+        // phantom loop_fired (goal continuations / task wakes must never count
+        // as loop fires). Classify it as plain spontaneous activity — it is
+        // still a genuine pre-turn, so mark it so a handed-off prompt drain
+        // defers past its idle boundary; the wake attribution is left to the
+        // user-prompt replay path (a native cron wake always injects one).
+        turnKind = "plain";
+        sawSpontaneousPreTurn = true;
+        return;
+      }
+      const loop = matchLoopForWake(loops, userText);
+      if (!loop) {
+        // The user message matched no armed loop prompt (or matched more than
+        // one ambiguously) — not enough evidence of a specific wake. Wait for
+        // further activity rather than guessing a loop.
+        return;
       }
       turnKind = "wake";
       sawSpontaneousPreTurn = true;
