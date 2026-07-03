@@ -238,6 +238,40 @@ describe("extMethod dispatch", () => {
     );
   });
 
+  it("clears the shared in-flight query.next() when it rejects so the session recovers", async () => {
+    const { agent } = createAgent();
+    const session = injectSession(agent, "s1");
+    let calls = 0;
+    // First next() rejects with a non-process-exit error; a later drain must
+    // start a fresh next() instead of re-awaiting the poisoned promise.
+    session.query = {
+      next: () => {
+        calls += 1;
+        if (calls === 1) {
+          return Promise.reject(new Error("transient transport hiccup"));
+        }
+        return Promise.resolve({ done: true, value: undefined });
+      },
+    } as unknown as (typeof session)["query"];
+
+    await expect(
+      (agent as unknown as { drainTurn: (p: unknown) => Promise<unknown> }).drainTurn({
+        sessionId: "s1",
+        session,
+        owner: "prompt",
+        promptUuid: "p1",
+      }),
+    ).rejects.toThrow("transient transport hiccup");
+    expect(session.pendingQueryNext ?? null).toBeNull();
+
+    // A subsequent drain must call next() fresh, not re-await the rejection.
+    const outcome = await (
+      agent as unknown as { drainTurn: (p: unknown) => Promise<unknown> }
+    ).drainTurn({ sessionId: "s1", session, owner: "prompt", promptUuid: "p2" });
+    expect(outcome).toEqual({ kind: "stream_ended" });
+    expect(calls).toBe(2);
+  });
+
   it("rejects goal/set with status paused (no native pause on claude)", async () => {
     const { agent } = createAgent();
     const session = injectSession(agent, "s1");

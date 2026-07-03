@@ -1208,9 +1208,21 @@ export class ClaudeAcpAgent implements Agent {
         const interrupted = new Promise<"interrupted">((resolve) => {
           session.anyharness.pumpInterrupt = () => resolve("interrupted");
         });
-        const winner = await Promise.race([pull, interrupted]);
+        let winner: IteratorResult<SDKMessage, void> | "interrupted";
+        try {
+          winner = await Promise.race([pull, interrupted]);
+        } catch (error) {
+          // The in-flight next() rejected. Clear it so the poisoned promise
+          // isn't re-awaited by every future drain (which would wedge the
+          // session forever); a later drain starts a fresh next().
+          session.anyharness.pumpInterrupt = null;
+          session.pendingQueryNext = null;
+          throw error;
+        }
         session.anyharness.pumpInterrupt = null;
         if (winner === "interrupted") {
+          // Leave pendingQueryNext set: the pull is still in flight and the
+          // prompt taking over will await it.
           return { kind: "handed_off" };
         }
         iteration = winner;
@@ -1218,7 +1230,15 @@ export class ClaudeAcpAgent implements Agent {
         // The #680 force-cancel backstop races the shared pull: a wedged
         // query.next() that never yields is abandoned so cancel() still
         // resolves the prompt as "cancelled" per the ACP contract.
-        const next = await Promise.race([pull, params.cancelled]);
+        let next: IteratorResult<SDKMessage, void> | void;
+        try {
+          next = await Promise.race([pull, params.cancelled]);
+        } catch (error) {
+          // A rejected next() must not stay cached, or the next prompt()/pump
+          // drain re-throws the same stale error indefinitely.
+          session.pendingQueryNext = null;
+          throw error;
+        }
         if (params.cancelController?.signal.aborted) {
           void pull.catch(() => {});
           session.pendingQueryNext = null;
@@ -1226,7 +1246,14 @@ export class ClaudeAcpAgent implements Agent {
         }
         iteration = next as IteratorResult<SDKMessage, void>;
       } else {
-        iteration = await pull;
+        try {
+          iteration = await pull;
+        } catch (error) {
+          // See above: a rejected next() must not stay cached, or the next
+          // prompt()/pump drain re-throws the same stale error indefinitely.
+          session.pendingQueryNext = null;
+          throw error;
+        }
       }
       session.pendingQueryNext = null;
       const { value: message, done } = iteration;
