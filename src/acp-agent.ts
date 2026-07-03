@@ -74,6 +74,7 @@ import {
   AnyharnessTranscriptEvent,
   classifyGoalStatus,
   computeTranscriptPath,
+  extractCronFirePrompt,
   extractCronId,
   extractGoalStatus,
   GoalStatusRow,
@@ -1634,6 +1635,11 @@ export class ClaudeAcpAgent implements Agent {
     const expr = schedule.expr.trim();
     const recurring = params.recurring !== false;
 
+    // Ensure the transcript tailer is running before the loop can fire — it is
+    // the sole source of loop-fire bookkeeping (native cron wakes don't replay a
+    // matchable prompt on the SDK stream; see recordLoopFireFromTranscript).
+    this.ensureTranscriptTailer(sessionId, session);
+
     if (!this.canInjectNow(session)) {
       // Deferral fix (mirrors goal/set): a turn is streaming, so "/loop" sent
       // now would degrade to a never-executing queued prompt. Blocking on the
@@ -2279,7 +2285,47 @@ export class ClaudeAcpAgent implements Agent {
     tailer.start();
   }
 
+  /**
+   * Attributes a transcript-observed cron fire to the armed loop whose prompt it
+   * replays, advancing that loop's fire bookkeeping and emitting `loop_fired`.
+   * Matched via `matchLoopForWake` so an ambiguous/unmatched injected prompt
+   * (e.g. a goal continuation, or the `/loop` help injection that slips through)
+   * credits nothing rather than corrupting a loop's count.
+   */
+  private recordLoopFireFromTranscript(sessionId: string, prompt: string): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const ah = session.anyharness;
+    const loop = matchLoopForWake(activeLoops(ah), prompt);
+    if (!loop) {
+      return;
+    }
+    const now = Date.now();
+    loop.fireCount += 1;
+    loop.lastFiredAtMs = now;
+    loop.updatedAtMs = now;
+    this.logger.log(
+      `[anyharness] loop fire (transcript): loopId=${loop.loopId} fireCount=${loop.fireCount}`,
+    );
+    void this.sendAnyharnessEvent(sessionId, "loop_fired", {
+      loop: loopWireFromState(loop),
+      loopId: loop.loopId,
+    });
+  }
+
   private handleTranscriptRow(sessionId: string, row: unknown): void {
+    // A native cron/loop FIRE is recorded in the transcript (not on the SDK
+    // stream) as a dequeued isMeta user row carrying the injected prompt — see
+    // extractCronFirePrompt. This is the ONLY reliable fire signal for Claude
+    // native loops, so fireCount/lastFiredAtMs and loop_fired are driven here.
+    const cronFirePrompt = extractCronFirePrompt(row);
+    if (cronFirePrompt) {
+      this.recordLoopFireFromTranscript(sessionId, cronFirePrompt);
+      return;
+    }
+
     const goalStatus = extractGoalStatus(row);
     if (!goalStatus) {
       return;

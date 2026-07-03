@@ -7,6 +7,7 @@ import { ClaudeAcpAgent } from "../acp-agent.js";
 import {
   AnyharnessSessionState,
   classifyGoalStatus,
+  extractCronFirePrompt,
   extractCronId,
   extractGoalStatus,
   isSyntheticLoopId,
@@ -387,6 +388,45 @@ describe("subagentFeedPath", () => {
     expect(subagentFeedPath("/home/u/.claude/projects/proj/sess.jsonl", "sess", "task9")).toBe(
       "/home/u/.claude/projects/proj/sess/subagents/agent-task9.jsonl",
     );
+  });
+});
+
+describe("extractCronFirePrompt", () => {
+  it("reads the injected prompt from a dequeued isMeta cron-fire user row", () => {
+    // Live wire (haiku probe): a cron fire lands in the transcript as an isMeta
+    // user row whose content is the plain injected prompt string.
+    expect(
+      extractCronFirePrompt({
+        type: "user",
+        isMeta: true,
+        message: { role: "user", content: "append the word PING to PING.log" },
+      }),
+    ).toBe("append the word PING to PING.log");
+  });
+
+  it("ignores non-fire rows: the /loop help injection, plain user turns, tool results", () => {
+    // The /loop slash-command's own isMeta help injection has ARRAY content, not
+    // a plain string, so it must not read as a fire.
+    expect(
+      extractCronFirePrompt({
+        type: "user",
+        isMeta: true,
+        message: { role: "user", content: [{ type: "text", text: "# /loop — schedule…" }] },
+      }),
+    ).toBeNull();
+    // An ordinary (non-isMeta) user message is not a cron fire.
+    expect(
+      extractCronFirePrompt({ type: "user", message: { role: "user", content: "hi" } }),
+    ).toBeNull();
+    // A tool_result user row (array content) is not a cron fire.
+    expect(
+      extractCronFirePrompt({
+        type: "user",
+        message: { role: "user", content: [{ type: "tool_result", content: "PING" }] },
+      }),
+    ).toBeNull();
+    expect(extractCronFirePrompt({ type: "assistant" })).toBeNull();
+    expect(extractCronFirePrompt(null)).toBeNull();
   });
 });
 
@@ -1350,6 +1390,110 @@ describe("extMethod dispatch", () => {
       expect(result.processes.map((p) => p.id)).toEqual(["t1"]);
       expect(result.loops).toHaveLength(1);
       expect(session.anyharness.processes.size).toBe(1);
+    });
+  });
+
+  describe("loop fire counting from the transcript", () => {
+    const flush = () => new Promise((r) => setTimeout(r, 0));
+
+    it("counts a cron fire from a dequeued isMeta prompt row and emits loop_fired", async () => {
+      // Native cron wakes never replay a matchable prompt on the SDK stream, so
+      // fireCount is driven off the transcript's dequeued cron-prompt rows.
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      session.anyharness.loops.set("loop-1", activeLoop({ loopId: "loop-1", prompt: "append PING" }));
+
+      call(agent, "handleTranscriptRow", "s1", {
+        type: "user",
+        isMeta: true,
+        message: { role: "user", content: "append PING" },
+      });
+      await flush();
+
+      expect(loopFiredEvents(updates)).toHaveLength(1);
+      expect(loopFiredEvents(updates)[0]!.loopId).toBe("loop-1");
+      const loop = session.anyharness.loops.get("loop-1");
+      expect(loop?.fireCount).toBe(1);
+      expect(loop?.lastFiredAtMs).not.toBeNull();
+
+      // A second fire advances it again.
+      call(agent, "handleTranscriptRow", "s1", {
+        type: "user",
+        isMeta: true,
+        message: { role: "user", content: "append PING" },
+      });
+      await flush();
+      expect(session.anyharness.loops.get("loop-1")?.fireCount).toBe(2);
+    });
+
+    it("does not fire for the /loop help injection or an unmatched injected prompt", async () => {
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      session.anyharness.loops.set("loop-1", activeLoop({ loopId: "loop-1", prompt: "append PING" }));
+
+      // The /loop slash-command help injection: isMeta, but ARRAY content.
+      call(agent, "handleTranscriptRow", "s1", {
+        type: "user",
+        isMeta: true,
+        message: { role: "user", content: [{ type: "text", text: "# /loop — schedule…" }] },
+      });
+      // An isMeta prompt that matches no armed loop (e.g. a goal continuation).
+      call(agent, "handleTranscriptRow", "s1", {
+        type: "user",
+        isMeta: true,
+        message: { role: "user", content: "some unrelated injected instruction" },
+      });
+      await flush();
+
+      expect(loopFiredEvents(updates)).toHaveLength(0);
+      expect(session.anyharness.loops.get("loop-1")?.fireCount).toBe(0);
+    });
+  });
+
+  describe("background process exit via the idle pump", () => {
+    const flush = () => new Promise((r) => setTimeout(r, 0));
+
+    it("drains a background-bash task_notification while idle and flips the process to exited", async () => {
+      // Proves the full idle-pump path (not just a direct handleTaskEvent call):
+      // once the arming turn ends, the completion notification arrives on the
+      // idle iterator and the roster flips running → exited with its feed.
+      const { agent, updates } = createAgent();
+      const session = injectSession(agent, "s1", tempTranscript());
+      session.query = queryFrom([
+        { type: "system", subtype: "init", session_id: "s1" },
+        {
+          type: "system",
+          subtype: "task_started",
+          task_id: "t1",
+          tool_use_id: "tu1",
+          task_type: "local_bash",
+          description: "sleep 30 && echo OK > out.txt",
+          session_id: "s1",
+        },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "t1",
+          status: "completed",
+          output_file: "/tmp/tasks/t1.output",
+          summary: "done",
+          session_id: "s1",
+        },
+        resultMsg(0, 0),
+        { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+      ]);
+
+      const outcome = await drainTurn(agent, { sessionId: "s1", session, owner: "pump" });
+      expect(outcome).toEqual({ kind: "turn_ended", stopReason: "end_turn" });
+      await flush();
+
+      const proc = session.anyharness.processes.get("t1");
+      expect(proc).toMatchObject({ status: "exited" });
+      expect(proc?.feed).toEqual({ transport: "tail_file", path: "/tmp/tasks/t1.output" });
+      const exited = anyharnessEvents(updates).filter(
+        (e) => e.transcriptEvent === "process_upserted" && e.process?.status === "exited",
+      );
+      expect(exited).toHaveLength(1);
     });
   });
 

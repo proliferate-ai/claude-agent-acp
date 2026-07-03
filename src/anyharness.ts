@@ -623,6 +623,47 @@ export function extractGoalStatus(row: unknown): GoalStatusRow | null {
 }
 
 /**
+ * Extracts the injected prompt of a native cron/loop FIRE from one parsed
+ * transcript row, or null if the row is not a cron fire.
+ *
+ * Why the transcript (and not the SDK message stream): live-verified against
+ * Claude Code 2.1.199, a scheduled cron wake does NOT replay a user message
+ * carrying its prompt onto the SDK stream — even with `--replay-user-messages`
+ * on, the wake turn presents as a bare spontaneous assistant turn (system:init
+ * → assistant thinking → …). So `markSpontaneousTurn`/`matchLoopForWake` never
+ * had any user text to match a fire against, and `fireCount` stayed frozen at 0
+ * through real fires (gate C "two fires as LoopFired events" / "loops panel
+ * matches" FAIL). The cron prompt IS persisted in the transcript, though, as a
+ * dequeued `{ type: "user", isMeta: true, message.content: "<prompt string>" }`
+ * row (preceded by a `queue-operation`). That row is the authoritative fire
+ * signal.
+ *
+ * We require a plain-STRING `message.content` so this never matches the
+ * `/loop` slash-command's own `isMeta` help injection (whose content is an
+ * array of text blocks), and the caller further gates on the string matching an
+ * armed loop's prompt.
+ */
+export function extractCronFirePrompt(row: unknown): string | null {
+  if (typeof row !== "object" || row === null) {
+    return null;
+  }
+  const candidate = row as {
+    type?: unknown;
+    isMeta?: unknown;
+    message?: { role?: unknown; content?: unknown };
+  };
+  if (candidate.type !== "user" || candidate.isMeta !== true) {
+    return null;
+  }
+  const content = candidate.message?.content;
+  if (typeof content !== "string") {
+    return null;
+  }
+  const text = content.trim();
+  return text.length > 0 ? text : null;
+}
+
+/**
  * Fallback transcript location when no hook has reported transcript_path yet:
  * <configDir>/projects/<munged cwd>/<sessionId>.jsonl
  */
