@@ -15,6 +15,36 @@ import { Pushable } from "../utils.js";
 
 const silentLogger = { log: () => {}, error: () => {} };
 
+/** Minimal SDK "result" message carrying only the fields drainTurn reads. */
+function resultMsg(inputTokens: number, outputTokens: number): any {
+  return {
+    type: "result",
+    subtype: "success",
+    stop_reason: null,
+    is_error: false,
+    result: "",
+    total_cost_usd: 0,
+    modelUsage: {},
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+  };
+}
+
+/** A query stub that yields a fixed list of SDK messages via next(). */
+function queryFrom(messages: any[]): any {
+  let i = 0;
+  return {
+    next: async () =>
+      i < messages.length
+        ? { done: false, value: messages[i++] }
+        : { done: true, value: undefined },
+  };
+}
+
 function goalStatusLine(attachment: Record<string, unknown>): string {
   return (
     JSON.stringify({
@@ -438,5 +468,78 @@ describe("extMethod dispatch", () => {
       )
       .find((meta) => meta?.transcriptEvent === "goal_met");
     expect(metUpdate?.goal?.metReason).toBe("file is present");
+  });
+
+  function armLoop(session: ReturnType<typeof injectSession>, prompt: string) {
+    session.anyharness.loops.set("loop-1", {
+      loopId: "loop-1",
+      prompt,
+      schedule: { kind: "interval", expr: "5m" },
+      recurring: true,
+      status: "active",
+      lastFiredAtMs: null,
+      fireCount: 0,
+      updatedAtMs: Date.now(),
+    });
+  }
+
+  const drainTurn = (agent: ClaudeAcpAgent, params: unknown): Promise<unknown> =>
+    (agent as unknown as { drainTurn: (p: unknown) => Promise<unknown> }).drainTurn(params);
+
+  it("a prompt drain handed a cron-wake pre-turn emits loop_fired and ends on its own turn", async () => {
+    const { agent, updates } = createAgent();
+    const session = injectSession(agent, "s1");
+    armLoop(session, "check the build");
+    const promptUuid = "prompt-uuid-1";
+
+    session.query = queryFrom([
+      // Spontaneous cron-wake pre-turn (handed off from the interrupted pump).
+      { type: "system", subtype: "init", session_id: "s1" },
+      {
+        type: "user",
+        uuid: "wake-uuid",
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "user", content: "check the build" },
+      },
+      resultMsg(100, 50),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+      // The prompt's own message replay + its own turn.
+      { type: "system", subtype: "init", session_id: "s1" },
+      {
+        type: "user",
+        uuid: promptUuid,
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "user", content: "hello" },
+      },
+      resultMsg(7, 3),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+    ]);
+    // Simulate the pump handoff: the in-flight next() is left on the session,
+    // which is also the signal (pendingQueryNext != null) that this drain was
+    // handed the stream mid-flight rather than owning it from the start.
+    session.pendingQueryNext = session.query.next();
+
+    const outcome = await drainTurn(agent, {
+      sessionId: "s1",
+      session,
+      owner: "prompt",
+      promptUuid,
+    });
+    // It ends on ITS OWN turn's idle, not the wake pre-turn's idle boundary.
+    expect(outcome).toEqual({ kind: "turn_ended", stopReason: "end_turn" });
+
+    // loop_fired is emitted for the wake even though a prompt drain saw it.
+    const loopFired = updates
+      .map(
+        (u) =>
+          (u.update as { _meta?: { anyharness?: { transcriptEvent?: string; loopId?: string } } })
+            ._meta?.anyharness,
+      )
+      .filter((m) => m?.transcriptEvent === "loop_fired");
+    expect(loopFired).toHaveLength(1);
+    expect(loopFired[0]!.loopId).toBe("loop-1");
+    expect(session.anyharness.loops.get("loop-1")?.fireCount).toBe(1);
   });
 });
