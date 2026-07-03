@@ -88,8 +88,8 @@ export type PendingLoopSet = {
 /** Per-session goal/loop bookkeeping, attached to the ACP Session. */
 export type AnyharnessSessionState = {
   goal: GoalState | null;
-  /** Objective for which we already emitted goal_updated at arm time (dedupe vs transcript sentinel). */
-  goalArmAnnounced: string | null;
+  /** Watchers invoked with every goal_status transcript row (used by goal/set + goal/clear to await native confirmation). */
+  goalRowWatchers: ((row: GoalStatusRow) => void)[];
   loops: Map<string, LoopState>;
   /** loop/set calls whose CronCreate tool_use hasn't been observed yet. */
   pendingLoopSets: PendingLoopSet[];
@@ -102,12 +102,14 @@ export type AnyharnessSessionState = {
   /** Whether the tailer should read the transcript from byte 0 (fresh session) or from EOF (resume/fork). */
   tailFromStart: boolean;
   pumpRunning: boolean;
+  /** Resolver that makes an idle-blocked pump yield the message stream to a queued prompt(). */
+  pumpInterrupt: (() => void) | null;
 };
 
 export function newAnyharnessSessionState(tailFromStart: boolean): AnyharnessSessionState {
   return {
     goal: null,
-    goalArmAnnounced: null,
+    goalRowWatchers: [],
     loops: new Map(),
     pendingLoopSets: [],
     loopClearWatchers: [],
@@ -116,6 +118,7 @@ export function newAnyharnessSessionState(tailFromStart: boolean): AnyharnessSes
     tailer: null,
     tailFromStart,
     pumpRunning: false,
+    pumpInterrupt: null,
   };
 }
 
@@ -173,6 +176,28 @@ function isGoalStatusRow(value: unknown): value is GoalStatusRow {
   );
 }
 
+export type GoalRowKind = "armed" | "cleared" | "met" | "failed" | "progress";
+
+/**
+ * Classifies a goal_status transcript row (live-verified against Claude Code
+ * 2.1.198): sentinel rows are zero-evaluation bookkeeping markers — arm
+ * writes {met:false, sentinel:true, condition}, "/goal clear" writes
+ * {met:true, sentinel:true, condition}. Evaluator rows carry no sentinel:
+ * {met, condition, reason} (met:true auto-clears the native goal).
+ */
+export function classifyGoalStatus(row: GoalStatusRow): GoalRowKind {
+  if (row.sentinel) {
+    return row.met ? "cleared" : "armed";
+  }
+  if (row.met) {
+    return "met";
+  }
+  if (row.failed) {
+    return "failed";
+  }
+  return "progress";
+}
+
 /**
  * Liberal extraction of a goal_status attachment from one parsed transcript
  * row. Transcript rows are `{type: "attachment", attachment: {...}}`, but we
@@ -207,6 +232,38 @@ export function extractGoalStatus(row: unknown): GoalStatusRow | null {
 export function computeTranscriptPath(configDir: string, cwd: string, sessionId: string): string {
   const munged = cwd.replace(/[^a-zA-Z0-9]/g, "-");
   return path.join(configDir, "projects", munged, `${sessionId}.jsonl`);
+}
+
+/**
+ * Reads the last goal_status row already present in a transcript. Used to
+ * seed the goal mirror on resume/fork (native goals survive `--resume` but
+ * the tailer only reads appended rows for those sessions).
+ */
+export function readLastGoalStatus(filePath: string): GoalStatusRow | null {
+  let text: string;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return null;
+  }
+  let last: GoalStatusRow | null = null;
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes('"goal_status"')) {
+      continue;
+    }
+    let row: unknown;
+    try {
+      row = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const goalStatus = extractGoalStatus(row);
+    if (goalStatus) {
+      last = goalStatus;
+    }
+  }
+  return last;
 }
 
 const TAIL_DEBOUNCE_MS = 50;
