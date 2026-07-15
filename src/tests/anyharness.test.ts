@@ -843,3 +843,25 @@ describe("extMethod dispatch", () => {
     expect(texts.filter((t) => t === "Hello world")).toHaveLength(0);
   });
 });
+
+describe("teardown disposes the transcript tailer", () => {
+  it("teardownSession disposes the session's tailer watcher and poll timer", async () => {
+    // Structural guard for the leak where only the error paths disposed the
+    // tailer: the normal teardown path must dispose it too. The tailer holds
+    // a real fs directory watcher, so a missed dispose leaks an fd per
+    // closed session.
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const source = fs.readFileSync(
+      path.join(__dirname, "..", "acp-agent.ts"),
+      "utf8",
+    );
+    const teardownStart = source.indexOf("private async teardownSession(");
+    expect(teardownStart).toBeGreaterThan(-1);
+    const teardownBody = source.slice(
+      teardownStart,
+      source.indexOf("\n  }", teardownStart),
+    );
+    expect(teardownBody).toContain("tailer?.dispose()");
+  });
+});

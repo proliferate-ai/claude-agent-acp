@@ -2799,6 +2799,11 @@ export class ClaudeAcpAgent implements Agent {
     }
     session.cancelController?.abort();
     session.settingsManager.dispose();
+    // The transcript tailer holds a real fs directory watcher plus a poll
+    // interval; without this, every normally-closed session leaks both (the
+    // error-path handlers dispose it, but this path is the common one).
+    session.anyharness.tailer?.dispose();
+    session.anyharness.tailer = null;
     session.abortController.abort();
     session.query.close();
     delete this.sessions[sessionId];
