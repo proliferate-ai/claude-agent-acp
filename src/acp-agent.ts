@@ -261,6 +261,24 @@ type Session = {
    * pump so an interrupted pump never loses a pulled message.
    */
   pendingQueryNext?: Promise<IteratorResult<SDKMessage, void>> | null;
+  /** Anthropic API message id of the assistant message currently streaming,
+   *  captured from `message_start`. Lives on the session (not a `drainTurn`
+   *  local) so it survives a drain boundary: the GoalPort idle pump loops
+   *  `drainTurn` per turn and hands the stream between pump and prompt drains,
+   *  so a single streamed assistant message's `message_start` and its
+   *  content-block deltas can land in different `drainTurn` calls. */
+  currentStreamMessageId?: string;
+  /** Per-message-id record of which top-level assistant content actually
+   *  streamed live via `stream_event` deltas (split by block type). The
+   *  `assistant` case drops consolidated blocks whose id is recorded here so a
+   *  streamed message is emitted exactly once. Session-scoped for the same
+   *  reason as `currentStreamMessageId`: the streamed deltas and the
+   *  consolidated SDK message can be drained by different `drainTurn` calls, so
+   *  a per-drain Set would reset and re-emit the already-streamed content.
+   *  Keyed by unique API message id, so persisting across turns only ever adds
+   *  correct suppression. */
+  streamedTextIds?: Set<string>;
+  streamedThinkingIds?: Set<string>;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -1155,12 +1173,17 @@ export class ClaudeAcpAgent implements Agent {
     // Tracks whether we're inside a compaction (the SDK emits the terminal
     // compact_result status twice for a single failed compaction).
     let compactionInProgress = false;
-    // Anthropic API message id of the assistant message currently streaming.
-    let currentStreamMessageId: string | undefined;
-    // Per-message-id record of which assistant content streamed live, so the
-    // `assistant` case can drop duplicates but forward un-streamed blocks.
-    const streamedTextIds = new Set<string>();
-    const streamedThinkingIds = new Set<string>();
+    // Streamed-content bookkeeping lives on the session, not this drain, so it
+    // survives a drain boundary. The GoalPort idle pump loops `drainTurn` per
+    // turn and hands the stream between pump and prompt drains, so a single
+    // streamed assistant message's `message_start`, its deltas, and its
+    // consolidated SDK message can be split across separate `drainTurn` calls.
+    // A per-drain reset would lose the record of what already streamed and
+    // re-emit the consolidated block (the streamed-message duplicate bug).
+    session.streamedTextIds ??= new Set<string>();
+    session.streamedThinkingIds ??= new Set<string>();
+    const streamedTextIds = session.streamedTextIds;
+    const streamedThinkingIds = session.streamedThinkingIds;
 
     // Classification of a turn drained by the idle pump:
     // - "injected": triggered by a goal/loop instruction we pushed ourselves
@@ -1711,7 +1734,7 @@ export class ClaudeAcpAgent implements Agent {
           // so the streamed chunks that follow (whose delta events don't carry
           // it) can all be tagged with the same, replay-stable id.
           if (message.event.type === "message_start") {
-            currentStreamMessageId = message.event.message.id || undefined;
+            session.currentStreamMessageId = message.event.message.id || undefined;
           }
           // Record that this top-level message id actually streamed text/
           // thinking, so the `assistant` case below knows its assembled blocks
@@ -1719,14 +1742,14 @@ export class ClaudeAcpAgent implements Agent {
           // them). Gated on `parent_tool_use_id === null` so a subagent stream
           // can't attribute its content to the top-level message id.
           if (
-            currentStreamMessageId &&
+            session.currentStreamMessageId &&
             message.parent_tool_use_id === null &&
             message.event.type === "content_block_delta"
           ) {
             if (message.event.delta.type === "text_delta") {
-              streamedTextIds.add(currentStreamMessageId);
+              streamedTextIds.add(session.currentStreamMessageId);
             } else if (message.event.delta.type === "thinking_delta") {
-              streamedThinkingIds.add(currentStreamMessageId);
+              streamedThinkingIds.add(session.currentStreamMessageId);
             }
           }
           if (
@@ -1790,7 +1813,7 @@ export class ClaudeAcpAgent implements Agent {
               clientCapabilities: this.clientCapabilities,
               cwd: session.cwd,
               taskState: session.taskState,
-              messageId: currentStreamMessageId,
+              messageId: session.currentStreamMessageId,
             },
           )) {
             await this.client.sessionUpdate(notification);

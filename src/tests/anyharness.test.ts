@@ -738,4 +738,108 @@ describe("extMethod dispatch", () => {
       cachedWriteTokens: 0,
     });
   });
+
+  // Regression: a streamed assistant message must reach the client exactly
+  // once even when its live deltas and its consolidated SDK message are drained
+  // by different drainTurn calls. The idle pump loops drainTurn per turn and
+  // hands the stream between pump and prompt drains, so the streamed content
+  // (message_start + deltas, call #1) and the final assistant message with the
+  // same API id (call #2) can straddle a drain boundary. Streamed-content
+  // bookkeeping lives on the session so the second drain still suppresses the
+  // consolidated block instead of re-emitting the whole reply.
+  it("does not re-emit streamed assistant content when the consolidated message lands in a later drain", async () => {
+    const { agent, updates } = createAgent();
+    const session = injectSession(agent, "s1");
+    const apiId = "msg_011stream";
+    const queuedUuid = "queued-prompt-uuid";
+
+    const streamStart = {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      session_id: "s1",
+      event: {
+        type: "message_start",
+        message: {
+          id: apiId,
+          model: "claude",
+          usage: {
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      },
+    };
+    const textDelta = (text: string) => ({
+      type: "stream_event",
+      parent_tool_use_id: null,
+      session_id: "s1",
+      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+    });
+
+    // Call #1: the message streams live, then a queued prompt's user-message
+    // replay hands the stream off before the consolidated assistant arrives.
+    session.pendingMessages.set(queuedUuid, { resolve: () => {}, order: 0 });
+    session.query = queryFrom([
+      streamStart,
+      textDelta("Hello "),
+      textDelta("world"),
+      {
+        type: "user",
+        uuid: queuedUuid,
+        parent_tool_use_id: null,
+        session_id: "s1",
+        message: { role: "user", content: "next" },
+      },
+    ]);
+    const out1 = await drainTurn(agent, { sessionId: "s1", session, owner: "pump" });
+    expect(out1).toEqual({ kind: "handed_off" });
+
+    // Call #2: the consolidated assistant message (SAME API id) + result + idle.
+    session.pendingQueryNext = null;
+    session.query = queryFrom([
+      {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: "assistant-uuid",
+        session_id: "s1",
+        message: {
+          id: apiId,
+          role: "assistant",
+          model: "claude",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "Hello world" }],
+          usage: {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      },
+      resultMsg(1, 2),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "s1" },
+    ]);
+    const out2 = await drainTurn(agent, {
+      sessionId: "s1",
+      session,
+      owner: "prompt",
+      promptUuid: "own-prompt-uuid",
+    });
+    expect(out2).toEqual({ kind: "turn_ended", stopReason: "end_turn" });
+
+    // The two streamed chunks reach the client; the consolidated "Hello world"
+    // block does NOT — so the full reply is delivered exactly once.
+    const textChunks = updates.filter(
+      (u) =>
+        u.update.sessionUpdate === "agent_message_chunk" &&
+        (u.update as { content?: { type?: string } }).content?.type === "text",
+    );
+    const texts = textChunks.map(
+      (u) => (u.update as { content: { text: string } }).content.text,
+    );
+    expect(texts).toEqual(["Hello ", "world"]);
+    expect(texts.filter((t) => t === "Hello world")).toHaveLength(0);
+  });
 });
