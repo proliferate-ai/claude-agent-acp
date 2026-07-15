@@ -3349,10 +3349,10 @@ describe("assembled assistant text fallback", () => {
     return { agent, updates };
   }
 
-  function messageStart(apiId: string) {
+  function messageStart(apiId: string, parentToolUseId: string | null = null) {
     return {
       type: "stream_event" as const,
-      parent_tool_use_id: null,
+      parent_tool_use_id: parentToolUseId,
       uuid: randomUUID(),
       session_id: "test-session",
       event: {
@@ -3362,10 +3362,10 @@ describe("assembled assistant text fallback", () => {
     };
   }
 
-  function textDelta(text: string) {
+  function textDelta(text: string, parentToolUseId: string | null = null) {
     return {
       type: "stream_event" as const,
-      parent_tool_use_id: null,
+      parent_tool_use_id: parentToolUseId,
       uuid: randomUUID(),
       session_id: "test-session",
       event: {
@@ -3530,11 +3530,8 @@ describe("assembled assistant text fallback", () => {
     expect(thoughtChunkTexts(updates)).toEqual(["private reasoning"]);
   });
 
-  it("does not leak subagent assistant text into the top-level feed", async () => {
+  it("surfaces assembled subagent text under its native parent tool", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    // Subagent assistant messages (parent_tool_use_id !== null) are never
-    // streamed live; their text/thinking is internal to the tool call and must
-    // stay filtered out, not surface as a fallback chunk.
     injectSession(agent, [
       assistantMessage(
         "msg-subagent",
@@ -3547,8 +3544,37 @@ describe("assembled assistant text fallback", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
 
-    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(messageChunkTexts(updates)).toEqual(["subagent internal prose"]);
     expect(thoughtChunkTexts(updates)).toEqual([]);
+    const child = updates.find(
+      (update) => update.update?.content?.text === "subagent internal prose",
+    );
+    expect(child.update._meta).toMatchObject({
+      anyharness: { parentToolCallId: "tool_use_1" },
+      claudeCode: { parentToolUseId: "tool_use_1" },
+    });
+  });
+
+  it("dedupes streamed subagent text without losing its parent identity", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      messageStart("msg-subagent-streamed", "tool_use_1"),
+      textDelta("nested work", "tool_use_1"),
+      assistantMessage(
+        "msg-subagent-streamed",
+        [{ type: "text", text: "nested work" }],
+        "tool_use_1",
+      ),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["nested work"]);
+    const child = updates.find((update) => update.update?.content?.text === "nested work");
+    expect(child.update.messageId).toBe("msg-subagent-streamed");
+    expect(child.update._meta?.anyharness?.parentToolCallId).toBe("tool_use_1");
   });
 
   it("forwards distinct blocks that a gateway splits across same-id messages", async () => {

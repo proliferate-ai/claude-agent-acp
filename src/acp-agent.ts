@@ -279,6 +279,9 @@ type Session = {
    *  correct suppression. */
   streamedTextIds?: Set<string>;
   streamedThinkingIds?: Set<string>;
+  /** Current streamed message id per native parent tool call. The root agent
+   *  uses the empty-string key; child agents use their parent_tool_use_id. */
+  currentStreamMessageIdsByParent?: Map<string, string>;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -354,6 +357,11 @@ type GatewayAuthRequest = AuthenticateRequest & { _meta?: GatewayAuthMeta };
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
+  anyharness?: {
+    nativeToolName?: string;
+    toolKind?: string;
+    parentToolCallId?: string;
+  };
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
@@ -1730,26 +1738,29 @@ export class ClaudeAcpAgent implements Agent {
         }
         case "stream_event": {
           await markSpontaneousTurn();
+          const streamParentKey = message.parent_tool_use_id ?? "";
+          session.currentStreamMessageIdsByParent ??= new Map<string, string>();
           // `message_start` carries the Anthropic API message id; capture it
           // so the streamed chunks that follow (whose delta events don't carry
           // it) can all be tagged with the same, replay-stable id.
           if (message.event.type === "message_start") {
-            session.currentStreamMessageId = message.event.message.id || undefined;
+            const streamMessageId = message.event.message.id || undefined;
+            if (streamMessageId) {
+              session.currentStreamMessageIdsByParent.set(streamParentKey, streamMessageId);
+            }
+            if (message.parent_tool_use_id === null) {
+              session.currentStreamMessageId = streamMessageId;
+            }
           }
-          // Record that this top-level message id actually streamed text/
-          // thinking, so the `assistant` case below knows its assembled blocks
-          // are duplicates (filter them) rather than the only copy (forward
-          // them). Gated on `parent_tool_use_id === null` so a subagent stream
-          // can't attribute its content to the top-level message id.
-          if (
-            session.currentStreamMessageId &&
-            message.parent_tool_use_id === null &&
-            message.event.type === "content_block_delta"
-          ) {
+          const streamMessageId = session.currentStreamMessageIdsByParent.get(streamParentKey);
+          // Record which content streamed for every native agent. The
+          // consolidated SDK message can then fill only missing blocks without
+          // duplicating either root-agent or child-agent text.
+          if (streamMessageId && message.event.type === "content_block_delta") {
             if (message.event.delta.type === "text_delta") {
-              streamedTextIds.add(session.currentStreamMessageId);
+              streamedTextIds.add(streamMessageId);
             } else if (message.event.delta.type === "thinking_delta") {
-              streamedThinkingIds.add(session.currentStreamMessageId);
+              streamedThinkingIds.add(streamMessageId);
             }
           }
           if (
@@ -1813,7 +1824,7 @@ export class ClaudeAcpAgent implements Agent {
               clientCapabilities: this.clientCapabilities,
               cwd: session.cwd,
               taskState: session.taskState,
-              messageId: session.currentStreamMessageId,
+              messageId: streamMessageId,
             },
           )) {
             await this.client.sessionUpdate(notification);
@@ -1966,10 +1977,10 @@ export class ClaudeAcpAgent implements Agent {
           }
 
           let content: typeof message.message.content;
-          if (message.type === "assistant" && message.parent_tool_use_id === null) {
-            // Top-level assistant message: drop text/thinking blocks already
-            // streamed live as chunks, and forward (as a fallback) any that were
-            // not, so non-streaming gateways still deliver the final answer.
+          if (message.type === "assistant") {
+            // Root and child assistant messages share the same dedupe rule:
+            // drop blocks already streamed live, and forward any assembled-only
+            // blocks so nested work survives non-streaming gateways and replay.
             const id = messageIdForGrouping(message);
             content = message.message.content.filter((item) => {
               // Non-text blocks (tool_use, etc.) always pass through; their own
@@ -1995,14 +2006,6 @@ export class ClaudeAcpAgent implements Agent {
               }
               return true;
             });
-          } else if (message.type === "assistant") {
-            // Subagent assistant message (`parent_tool_use_id !== null`). It is
-            // never streamed live and its text/thinking is internal to the tool
-            // call — keep dropping it so subagent prose doesn't leak into the
-            // top-level feed.
-            content = message.message.content.filter(
-              (item) => item.type !== "text" && item.type !== "thinking",
-            );
           } else {
             content = message.message.content;
           }
@@ -2981,6 +2984,7 @@ export class ClaudeAcpAgent implements Agent {
           clientCapabilities: this.clientCapabilities,
           cwd: this.sessions[sessionId]?.cwd,
           taskState: this.sessions[sessionId]?.taskState,
+          parentToolUseId: message.parent_tool_use_id,
           messageId: replayMessageId,
         },
       )) {
@@ -4543,6 +4547,9 @@ export function toAcpNotifications(
     if (options?.parentToolUseId) {
       update._meta = {
         ...update._meta,
+        anyharness: {
+          parentToolCallId: options.parentToolUseId,
+        },
         claudeCode: {
           ...(update._meta?.claudeCode || {}),
           parentToolUseId: options.parentToolUseId,
@@ -4762,7 +4769,10 @@ export function toAcpNotifications(
                 _meta: {
                   terminal_output: toolMeta.terminal_output,
                   ...(options?.parentToolUseId
-                    ? { claudeCode: { parentToolUseId: options.parentToolUseId } }
+                    ? {
+                        anyharness: { parentToolCallId: options.parentToolUseId },
+                        claudeCode: { parentToolUseId: options.parentToolUseId },
+                      }
                     : {}),
                 },
                 toolCallId: chunk.tool_use_id,
@@ -4812,12 +4822,22 @@ export function toAcpNotifications(
         break;
     }
     if (update) {
-      if (options?.parentToolUseId) {
+      const updateMeta = update._meta as ToolUpdateMeta | undefined;
+      const nativeToolName = updateMeta?.claudeCode?.toolName;
+      if (options?.parentToolUseId || nativeToolName) {
         update._meta = {
           ...update._meta,
+          anyharness: {
+            ...(updateMeta?.anyharness || {}),
+            ...(nativeToolName ? { nativeToolName } : {}),
+            ...(nativeToolName === "Agent" || nativeToolName === "Task"
+              ? { toolKind: "subagent" }
+              : {}),
+            ...(options?.parentToolUseId ? { parentToolCallId: options.parentToolUseId } : {}),
+          },
           claudeCode: {
-            ...(update._meta?.claudeCode || {}),
-            parentToolUseId: options.parentToolUseId,
+            ...(updateMeta?.claudeCode || {}),
+            ...(options?.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
           },
         };
       }
