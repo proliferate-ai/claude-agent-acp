@@ -45,6 +45,7 @@ import {
   type SDKMessageFilter,
   type StreamedToolInputCache,
 } from "../acp-agent.js";
+import { newAnyharnessSessionState } from "../anyharness.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
@@ -164,6 +165,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
+    anyharness: newAnyharnessSessionState(true),
     ...overrides,
   } as any;
 }
@@ -1954,6 +1956,7 @@ describe("permission request cancellation", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     } as any;
     return agent.sessions[sessionId]!;
   }
@@ -3737,6 +3740,7 @@ describe("session/close", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return agent.sessions[sessionId]!;
   }
@@ -3827,6 +3831,7 @@ describe("session/delete", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return agent.sessions[sessionId]!;
   }
@@ -3934,6 +3939,7 @@ describe("getOrCreateSession param change detection", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return agent.sessions[sessionId]!;
   }
@@ -6403,6 +6409,7 @@ describe("post-error recovery", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return { interrupt };
   }
@@ -9114,6 +9121,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      anyharness: newAnyharnessSessionState(true),
     };
     return { interrupt };
   }
@@ -10383,6 +10391,7 @@ describe("agent selection config option", () => {
         emittedAssistantText: false,
         owedTrailingIdles: 0,
         messageIdToUuid: new Map(),
+        anyharness: newAnyharnessSessionState(true),
       };
       return { session: agent.sessions[sessionId]!, applyFlagSettings };
     }
