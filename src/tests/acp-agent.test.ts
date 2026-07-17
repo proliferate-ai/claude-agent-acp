@@ -5862,7 +5862,9 @@ describe("assembled assistant text fallback", () => {
     }
 
     const chunks = updates.filter(
-      (update) => update.update?.sessionUpdate === "agent_message_chunk",
+      (update) =>
+        update.update?.sessionUpdate === "agent_message_chunk" &&
+        update.update._meta?.anyharness?.transcriptEvent === undefined,
     );
     expect(chunks.map((update) => update.update.content.text)).toEqual([
       "orphan 1",
@@ -5883,6 +5885,17 @@ describe("assembled assistant text fallback", () => {
       liveParent,
       liveParent,
     ]);
+    const activityEvents = updates
+      .map((update) => update.update?._meta?.anyharness)
+      .filter((event) => event?.transcriptEvent === "subagent_upserted");
+    expect(new Set(activityEvents.map((event) => event.subagent.id))).toEqual(
+      new Set(["agent-orphan-1", "agent-orphan-2", "agent-orphan-3", liveTaskId]),
+    );
+    expect(activityEvents.at(-1)?.subagent).toMatchObject({
+      id: liveTaskId,
+      status: "completed",
+      feed: { kind: "tail_file" },
+    });
   });
 
   it("caps quiescent child lanes across unmapped and synchronous no-level cycles", async () => {

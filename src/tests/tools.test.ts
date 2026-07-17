@@ -995,6 +995,63 @@ describe("Bash terminal output", () => {
     });
   });
 
+  describe("PostToolUse hook origin", () => {
+    it("keeps child transcript paths out of the parent tailer and forwards cron origin", async () => {
+      const transcriptPaths: string[] = [];
+      const cronCalls: Array<Record<string, unknown>> = [];
+      const hook = createPostToolUseHook(mockLogger, {
+        onTranscriptPath: (transcriptPath) => transcriptPaths.push(transcriptPath),
+        onCronTool: async (toolName, toolInput, toolResponse, origin) => {
+          cronCalls.push({ toolName, toolInput, toolResponse, origin });
+        },
+      });
+
+      await hook(
+        {
+          hook_event_name: "PostToolUse",
+          tool_name: "CronCreate",
+          tool_use_id: "toolu_main_cron",
+          tool_input: { prompt: "main cron" },
+          tool_response: "Scheduled recurring job main1234",
+          session_id: "test-session",
+          transcript_path: "/tmp/parent.jsonl",
+          cwd: "/tmp",
+          prompt_id: "main-prompt",
+        },
+        undefined,
+        { signal: AbortSignal.abort() },
+      );
+      await hook(
+        {
+          hook_event_name: "PostToolUse",
+          tool_name: "CronCreate",
+          tool_use_id: "toolu_child_cron",
+          tool_input: { prompt: "child cron" },
+          tool_response: "Scheduled recurring job child1234",
+          session_id: "test-session",
+          transcript_path: "/tmp/parent/subagents/agent-child-1.jsonl",
+          cwd: "/tmp",
+          prompt_id: "child-prompt",
+          agent_id: "child-1",
+        },
+        undefined,
+        { signal: AbortSignal.abort() },
+      );
+
+      expect(transcriptPaths).toEqual(["/tmp/parent.jsonl"]);
+      expect(cronCalls).toEqual([
+        expect.objectContaining({
+          toolInput: { prompt: "main cron" },
+          origin: { promptId: "main-prompt", agentId: undefined },
+        }),
+        expect.objectContaining({
+          toolInput: { prompt: "child cron" },
+          origin: { promptId: "child-prompt", agentId: "child-1" },
+        }),
+      ]);
+    });
+  });
+
   describe("post-tool-use hook sends diff content for Edit tool", () => {
     it("should include content and locations from structuredPatch in hook update", async () => {
       const toolUseCache: ToolUseCache = {};
