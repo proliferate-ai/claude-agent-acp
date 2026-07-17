@@ -5,6 +5,11 @@
     ".": {
       "changelog-path": "CHANGELOG.md",
       "release-type": "node",
+      "include-v-in-tag": true,
+      "include-component-in-tag": false,
+      "versioning": "prerelease",
+      "prerelease": true,
+      "prerelease-type": "proliferate",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true
     }

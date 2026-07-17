@@ -33,6 +33,7 @@
     "lint:fix": "eslint src --ext .ts --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "check:release": "node scripts/check-release-config.mjs",
     "check": "npm run lint && npm run format:check",
     "test": "vitest",
     "test:integration": "RUN_INTEGRATION_TESTS=true vitest run",
