@@ -204,6 +204,17 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 
+/** Absolute memory bound for quiescent child transcript reconciliation state
+ * that is not protected by the latest authoritative live-background level.
+ * Streamed output has already reached the client, so eviction can at worst make
+ * a late assembled fallback repeat that prefix; retaining it without a task id,
+ * terminal frame, level signal, or future prompt would leak indefinitely. Root
+ * and confirmed-live background lanes are never candidates. */
+const MAX_QUIESCENT_CHILD_STREAM_LANES = 32;
+/** Retire an unprotected quiescent lane after this many later SDK result
+ * boundaries even when the hard cap is not reached. */
+const MAX_QUIESCENT_CHILD_RESULT_AGE = 8;
+
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
  *  `result` — a model stream that dropped mid-turn, or an async agent that
@@ -1812,16 +1823,27 @@ export class ClaudeAcpAgent {
          * quiescent. Later background-task levels may retire it if its task
          * stays absent; any intervening stream activity clears the arm. */
         retireAfterLevel?: number;
-        /** First post-result generation that omitted the owning task. A second
+        /** First later level generation that omitted the owning task. A second
          * consecutive absent level retires it; an inclusive level resets this
-         * grace so a racing pre-registration payload cannot delete a live lane. */
+         * grace so a racing pre-registration payload cannot delete a live lane.
+         * Results do not erase the grace because a corrective level can arrive
+         * in a later autonomous cycle. */
         absentAfterLevel?: number;
+        /** First result generation after the lane's latest activity. Used for
+         * absolute age/cap eviction when no reliable task lifecycle exists. */
+        quiescentAfterResult?: number;
       }
     >();
     // Monotonic generation of authoritative background-task level signals.
     // Paired with a prior result boundary, it bounds lost-bookend child lanes
     // without guessing that a currently-active foreground child is dead.
     let backgroundLevelGeneration = 0;
+    // Results provide the only universal boundary shared by foreground,
+    // autonomous, mapped, and unmapped child cycles.
+    let resultGeneration = 0;
+    // Latest authoritative REPLACE-semantics background level. Only parents
+    // mapped to ids in this set are protected from absolute cache eviction.
+    let liveBackgroundTaskIds = new Set<string>();
     /** Drop a settled task's attribution and any interrupted transcript lane
      * together. A terminal task event is the boundary after which the SDK can
      * no longer emit child content, so retaining its partial text would leak one
@@ -1832,7 +1854,44 @@ export class ClaudeAcpAgent {
       if (parentKey) {
         streamedAssistantLanes.delete(parentKey);
       }
+      liveBackgroundTaskIds.delete(taskId);
       session.liveBackgroundTasks.delete(taskId);
+    };
+    /** Bound quiescent child reconciliation state even when task_started,
+     * terminal bookends, level signals, and future ACP prompts are all absent.
+     * This deletes only the already-delivered stream prefix cache: task
+     * attribution/hold state remains intact, and a late assembled message is
+     * forwarded in full rather than truncated. */
+    const pruneQuiescentChildStreamLanes = (): void => {
+      const protectedParents = new Set<string>();
+      for (const [taskId, record] of session.liveBackgroundTasks) {
+        if (record.parentToolUseId && liveBackgroundTaskIds.has(taskId)) {
+          protectedParents.add(record.parentToolUseId);
+        }
+      }
+
+      const candidates = () =>
+        [...streamedAssistantLanes.entries()].filter(
+          ([parentKey, lane]) =>
+            !!parentKey &&
+            lane.quiescentAfterResult !== undefined &&
+            lane.absentAfterLevel === undefined &&
+            !protectedParents.has(parentKey),
+        );
+
+      for (const [parentKey, lane] of candidates()) {
+        if (resultGeneration - lane.quiescentAfterResult! >= MAX_QUIESCENT_CHILD_RESULT_AGE) {
+          streamedAssistantLanes.delete(parentKey);
+        }
+      }
+
+      const overCap = candidates().sort(
+        ([, a], [, b]) => a.quiescentAfterResult! - b.quiescentAfterResult!,
+      );
+      const excess = overCap.length - MAX_QUIESCENT_CHILD_STREAM_LANES;
+      for (let i = 0; i < excess; i++) {
+        streamedAssistantLanes.delete(overCap[i][0]);
+      }
     };
     // Tool-use blocks start streaming before their JSON input. Keep the
     // partial input per parent message and block index so completed top-level
@@ -2967,6 +3026,7 @@ export class ClaudeAcpAgent {
                 // before the corrective inclusive level arrives.
                 backgroundLevelGeneration++;
                 const live = new Set(message.tasks.map((t) => t.task_id));
+                liveBackgroundTaskIds = live;
                 if (session.liveBackgroundTasks.size > 0) {
                   for (const [taskId, record] of session.liveBackgroundTasks) {
                     if (live.has(taskId)) {
@@ -3037,13 +3097,17 @@ export class ClaudeAcpAgent {
             // every child lane that has gone quiet; do not delete yet, because
             // a background task can legitimately outlive the cycle. A later
             // REPLACE-semantics background level confirms which armed tasks are
-            // absent. Stream activity after this point disarms its lane.
+            // absent. The universal result generation also ages/caps quiescent
+            // lanes whose lifecycle signals are missing. Stream activity after
+            // this point disarms its lane.
+            resultGeneration++;
             for (const [parentKey, lane] of streamedAssistantLanes) {
               if (parentKey) {
                 lane.retireAfterLevel = backgroundLevelGeneration;
-                lane.absentAfterLevel = undefined;
+                lane.quiescentAfterResult ??= resultGeneration;
               }
             }
+            pruneQuiescentChildStreamLanes();
             // A result from an autonomous cycle — a task-notification
             // followup, or a peer/coordinator/observer message the model
             // handled on its own (see AUTONOMOUS_RESULT_ORIGINS) — is not
@@ -3380,6 +3444,7 @@ export class ClaudeAcpAgent {
               // level must not retire its prefix until another result arms it.
               streamLane.retireAfterLevel = undefined;
               streamLane.absentAfterLevel = undefined;
+              streamLane.quiescentAfterResult = undefined;
             }
             // Accumulate the text/thinking actually streamed live, so the
             // `assistant` case below can diff its assembled blocks against what

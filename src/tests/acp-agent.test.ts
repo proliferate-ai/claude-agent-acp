@@ -5840,21 +5840,25 @@ describe("assembled assistant text fallback", () => {
       idle,
     );
 
-    const deleteSpy = vi.spyOn(Map.prototype, "delete");
+    const setSpy = vi.spyOn(Map.prototype, "set");
     try {
       injectSession(agent, messages);
       await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
       await agent.sessions["test-session"]?.consumer;
 
-      const retiredParents = deleteSpy.mock.calls
-        .map(([key]) => key)
-        .filter((key): key is string =>
-          typeof key === "string" ? key.startsWith("toolu_orphan_") : false,
-        );
-      expect(new Set(retiredParents)).toEqual(new Set(orphanParents));
+      const streamLaneSetIndex = setSpy.mock.calls.findIndex(
+        ([key, value]) =>
+          key === orphanParents[0] &&
+          typeof value === "object" &&
+          value !== null &&
+          "blocks" in value,
+      );
+      expect(streamLaneSetIndex).toBeGreaterThanOrEqual(0);
+      const streamLaneMap = setSpy.mock.contexts[streamLaneSetIndex] as Map<string, unknown>;
+      expect(orphanParents.filter((parent) => streamLaneMap.has(parent))).toEqual([]);
       expect(agent.sessions["test-session"]!.liveBackgroundTasks.size).toBe(0);
     } finally {
-      deleteSpy.mockRestore();
+      setSpy.mockRestore();
     }
 
     const chunks = updates.filter(
@@ -5879,6 +5883,241 @@ describe("assembled assistant text fallback", () => {
       liveParent,
       liveParent,
     ]);
+  });
+
+  it("caps quiescent child lanes across unmapped and synchronous no-level cycles", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const hardCap = 32;
+    const burstParents = Array.from({ length: 40 }, (_, i) => `toolu_unmapped_burst_${i}`);
+    const agedParents = Array.from({ length: 12 }, (_, i) => `toolu_unmapped_age_${i}`);
+    const boundedParents = [...burstParents, ...agedParents];
+    const protectedTaskId = "agent-confirmed-live";
+    const protectedParent = "toolu_confirmed_live";
+    const autonomousResult = () => ({
+      ...result(),
+      origin: { kind: "task-notification" },
+    });
+    const synchronousTaskStarted = (index: number) => ({
+      type: "system",
+      subtype: "task_started",
+      task_id: `agent-unmapped-age-${index}`,
+      tool_use_id: agedParents[index],
+      description: "Synchronous explore",
+      subagent_type: "Explore",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+
+    let markCapProcessed!: () => void;
+    const capProcessed = new Promise<void>((resolve) => {
+      markCapProcessed = resolve;
+    });
+    let releaseAfterCap!: () => void;
+    const afterCap = new Promise<void>((resolve) => {
+      releaseAfterCap = resolve;
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield result(); // settle the only ACP prompt
+        yield idle;
+
+        // Root reconciliation is never an eviction candidate, even while an
+        // autonomous process cycles through many orphaned child streams.
+        yield messageStart("msg-bounded-root");
+        yield textDelta("root prefix ");
+
+        // One mapped task is authoritatively live in the latest background
+        // level. It must remain protected through both the cap and >8 results.
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: protectedTaskId,
+          tool_use_id: protectedParent,
+          description: "Background explore",
+          subagent_type: "Explore",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [
+            {
+              task_id: protectedTaskId,
+              task_type: "local_agent",
+              description: "Background explore",
+            },
+          ],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield messageStart("msg-confirmed-live", protectedParent);
+        yield textDelta("live prefix ", protectedParent);
+
+        // No task_started, task terminal, background_tasks_changed, or
+        // consolidated assistant frames exist for these children. One result
+        // arms all 40 at once and must immediately enforce the hard cap of 32.
+        for (let i = 0; i < burstParents.length; i++) {
+          yield messageStart(`msg-unmapped-burst-${i}`, burstParents[i]);
+          yield textDelta(`burst ${i} `, burstParents[i]);
+        }
+        yield autonomousResult();
+        // The generator resumes only after the consumer processed the result,
+        // so the test can snapshot hard-cap deletions before aging begins.
+        markCapProcessed();
+        await afterCap;
+        yield idle;
+
+        // Reusing an evicted parent starts a fresh lane and message identity;
+        // the discarded prefix cache cannot poison its new reconciliation.
+        yield messageStart("msg-unmapped-recreated", burstParents[0]);
+        yield textDelta("recreated ", burstParents[0]);
+        yield assistantMessage(
+          "msg-unmapped-recreated",
+          [{ type: "text", text: "recreated tail" }],
+          burstParents[0],
+        );
+
+        // Repeated mapped synchronous/no-level lost-bookend cycles exercise the
+        // result-age path: task_started exists, but no terminal or background
+        // level ever follows. The first quiescent generation is preserved
+        // across results, so mapped-but-unconfirmed stale lanes still age.
+        for (let i = 0; i < agedParents.length; i++) {
+          yield synchronousTaskStarted(i);
+          yield messageStart(`msg-unmapped-age-${i}`, agedParents[i]);
+          yield textDelta(`aged ${i} `, agedParents[i]);
+          yield autonomousResult();
+          yield idle;
+        }
+
+        // The newest unconfirmed lane is still within the age/bound budget and
+        // retains normal prefix/tail reconciliation.
+        yield assistantMessage(
+          `msg-unmapped-age-${agedParents.length - 1}`,
+          [{ type: "text", text: `aged ${agedParents.length - 1} tail` }],
+          agedParents[agedParents.length - 1],
+        );
+
+        // One racing omission must retain the two-level grace even though the
+        // lane is already older than the age limit and the intervening result
+        // also enforces the cap. The corrective inclusive level proves it is
+        // still live, so consolidation must emit only the unstreamed tail.
+        yield {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield autonomousResult();
+        yield {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [
+            {
+              task_id: protectedTaskId,
+              task_type: "local_agent",
+              description: "Background explore",
+            },
+          ],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield assistantMessage(
+          "msg-confirmed-live",
+          [{ type: "text", text: "live prefix tail" }],
+          protectedParent,
+        );
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: protectedTaskId,
+          tool_use_id: protectedParent,
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+
+        // Later stream activity likewise disarms a quiescent lane and keeps its
+        // original message identity until consolidation.
+        const activeParent = "toolu_unmapped_active";
+        yield messageStart("msg-unmapped-active", activeParent);
+        yield textDelta("active ", activeParent);
+        yield autonomousResult();
+        yield textDelta("continued ", activeParent); // disarms result aging
+        yield assistantMessage(
+          "msg-unmapped-active",
+          [{ type: "text", text: "active continued tail" }],
+          activeParent,
+        );
+        yield idle;
+
+        yield assistantMessage("msg-bounded-root", [{ type: "text", text: "root prefix tail" }]);
+      }
+      return messageGenerator();
+    });
+
+    const setSpy = vi.spyOn(Map.prototype, "set");
+    let streamLaneMap: Map<string, unknown> | undefined;
+    try {
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      await capProcessed;
+      const streamLaneSetIndex = setSpy.mock.calls.findIndex(
+        ([key, value]) =>
+          key === burstParents[0] &&
+          typeof value === "object" &&
+          value !== null &&
+          "blocks" in value,
+      );
+      expect(streamLaneSetIndex).toBeGreaterThanOrEqual(0);
+      streamLaneMap = setSpy.mock.contexts[streamLaneSetIndex] as Map<string, unknown>;
+      expect(burstParents.filter((parent) => streamLaneMap!.has(parent))).toEqual(
+        burstParents.slice(8),
+      );
+      expect(streamLaneMap.has("")).toBe(true);
+      expect(streamLaneMap.has(protectedParent)).toBe(true);
+      releaseAfterCap();
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(
+        boundedParents.filter((parent) => streamLaneMap!.has(parent)).length,
+      ).toBeLessThanOrEqual(hardCap);
+      expect(streamLaneMap.has(agedParents[0])).toBe(false);
+    } finally {
+      releaseAfterCap();
+      setSpy.mockRestore();
+    }
+
+    // Eviction never weakens live delivery: all prefixes were already sent.
+    for (let i = 0; i < burstParents.length; i++) {
+      expect(
+        updates.some(
+          (update) =>
+            update.update?.messageId === `msg-unmapped-burst-${i}` &&
+            update.update?.content?.text === `burst ${i} `,
+        ),
+      ).toBe(true);
+    }
+
+    const chunksFor = (messageId: string) =>
+      updates
+        .filter((update) => update.update?.messageId === messageId)
+        .map((update) => update.update.content?.text)
+        .filter((text): text is string => typeof text === "string");
+    expect(chunksFor(`msg-unmapped-age-${agedParents.length - 1}`)).toEqual([
+      `aged ${agedParents.length - 1} `,
+      "tail",
+    ]);
+    expect(chunksFor("msg-confirmed-live")).toEqual(["live prefix ", "tail"]);
+    expect(chunksFor("msg-unmapped-recreated")).toEqual(["recreated ", "tail"]);
+    expect(chunksFor("msg-unmapped-active")).toEqual(["active ", "continued ", "tail"]);
+    expect(chunksFor("msg-bounded-root")).toEqual(["root prefix ", "tail"]);
   });
 
   it("keeps child tool progress nested with provider-neutral native metadata", async () => {
