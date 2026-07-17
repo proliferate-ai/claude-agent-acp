@@ -1,6 +1,6 @@
 # ACP adapter for the Claude Agent SDK
 
-[![npm](https://img.shields.io/npm/v/%40agentclientprotocol%2Fclaude-agent-acp)](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
+[![npm](https://img.shields.io/npm/v/%40proliferate%2Fclaude-agent-acp)](https://www.npmjs.com/package/@proliferate/claude-agent-acp)
 
 Use [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview#branding-guidelines) from [ACP-compatible](https://agentclientprotocol.com) clients!
 
