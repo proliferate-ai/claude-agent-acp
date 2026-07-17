@@ -1568,6 +1568,130 @@ describe("synthetic login message (issue #863)", () => {
   });
 });
 
+describe("native subagent replay", () => {
+  it("replays native subagent content and tools with stable parent-associated identity", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (update: SessionNotification) => {
+        updates.push(update);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "parent-message-uuid",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          id: "msg-parent",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent",
+              name: "Agent",
+              input: { description: "Investigate", prompt: "Inspect the code" },
+            },
+          ],
+        },
+      },
+      {
+        type: "assistant",
+        uuid: "child-message-uuid",
+        session_id: "s1",
+        parent_tool_use_id: "toolu_agent",
+        parent_agent_id: null,
+        message: {
+          id: "msg-child",
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "child reasoning", signature: "" },
+            { type: "text", text: "child finding" },
+          ],
+        },
+      },
+      {
+        type: "assistant",
+        uuid: "child-tool-message-uuid",
+        session_id: "s1",
+        parent_tool_use_id: "toolu_agent",
+        parent_agent_id: null,
+        message: {
+          id: "msg-child-tool",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_read",
+              name: "Read",
+              input: { file_path: "/tmp/example" },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "child-tool-result-uuid",
+        session_id: "s1",
+        parent_tool_use_id: "toolu_agent",
+        parent_agent_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_read",
+              content: [{ type: "text", text: "file contents" }],
+            },
+          ],
+        },
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    expect(updates.map((update) => update.update.sessionUpdate)).toEqual([
+      "tool_call",
+      "agent_thought_chunk",
+      "agent_message_chunk",
+      "tool_call",
+      "tool_call_update",
+    ]);
+    expect(updates[0].update).toMatchObject({
+      toolCallId: "toolu_agent",
+      _meta: {
+        anyharness: { nativeToolName: "Agent", toolKind: "subagent" },
+        claudeCode: { toolName: "Agent" },
+      },
+    });
+    for (const update of updates.slice(1)) {
+      expect(update.update._meta).toMatchObject({
+        anyharness: { parentToolCallId: "toolu_agent" },
+        claudeCode: { parentToolUseId: "toolu_agent" },
+      });
+    }
+    expect(updates[1].update).toMatchObject({ messageId: "msg-child" });
+    expect(updates[2].update).toMatchObject({ messageId: "msg-child" });
+    expect(updates[3].update._meta).toMatchObject({
+      anyharness: { nativeToolName: "Read", parentToolCallId: "toolu_agent" },
+      claudeCode: { toolName: "Read", parentToolUseId: "toolu_agent" },
+    });
+    expect(updates[4].update).toMatchObject({
+      toolCallId: "toolu_read",
+      status: "completed",
+      _meta: {
+        anyharness: { nativeToolName: "Read", parentToolCallId: "toolu_agent" },
+        claudeCode: { toolName: "Read", parentToolUseId: "toolu_agent" },
+      },
+    });
+  });
+});
+
 describe("escape markdown", () => {
   it("should escape markdown characters", () => {
     let text = "Hello *world*!";
@@ -1677,10 +1801,9 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
         consolidatedApiId = message.message.id;
       }
       if (message.type !== "stream_event") continue;
-      // Every streaming partial must belong to the top-level agent
-      // (parent_tool_use_id === null). Subagent work is folded into tool-result
-      // messages rather than surfaced as partial streams, which is what lets us
-      // track a single anchor without keying by parent_tool_use_id.
+      // Tools are disabled for this probe, so every partial should belong to the
+      // root lane. Production streaming also supports child lanes and keys their
+      // anchors independently by parent_tool_use_id.
       if (message.parent_tool_use_id !== null) allPartialsTopLevel = false;
       if (message.event.type === "message_start") {
         messageStartApiId = message.event.message.id;
@@ -2328,6 +2451,47 @@ describe("subagent permission attribution (issue #851)", () => {
     return { agent, updates, requests, log, session: agent.sessions["session-1"]! };
   }
 
+  it.each(["Agent", "Task"] as const)(
+    "includes native subagent metadata on a root %s permission request",
+    async (toolName) => {
+      const { agent, requests } = setup();
+
+      await agent.canUseTool("session-1")(toolName, { prompt: "investigate" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: `toolu_root_${toolName.toLowerCase()}`,
+      } as any);
+
+      expect(requests[0].toolCall._meta).toMatchObject({
+        anyharness: { nativeToolName: toolName, toolKind: "subagent" },
+        claudeCode: { toolName },
+      });
+      expect((requests[0].toolCall._meta as any).anyharness.parentToolCallId).toBeUndefined();
+      expect((requests[0].toolCall._meta as any).claudeCode.parentToolUseId).toBeUndefined();
+    },
+  );
+
+  it.each(["Bash", "ExitPlanMode"] as const)(
+    "includes native tool metadata on a root %s permission request",
+    async (toolName) => {
+      const { agent, requests } = setup();
+
+      await agent.canUseTool("session-1")(toolName, {}, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: `toolu_root_${toolName.toLowerCase()}`,
+      } as any);
+
+      expect(requests[0].toolCall._meta).toMatchObject({
+        anyharness: { nativeToolName: toolName },
+        claudeCode: { toolName },
+      });
+      expect((requests[0].toolCall._meta as any).anyharness.toolKind).toBeUndefined();
+      expect((requests[0].toolCall._meta as any).anyharness.parentToolCallId).toBeUndefined();
+      expect((requests[0].toolCall._meta as any).claudeCode.parentToolUseId).toBeUndefined();
+    },
+  );
+
   it("attributes a subagent tool's eager tool_call and permission request to the spawning tool call", async () => {
     const { agent, updates, requests, session } = setup();
     session.liveBackgroundTasks.set("agent-42", {
@@ -2345,16 +2509,20 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(updates[0].update).toMatchObject({
       sessionUpdate: "tool_call",
       toolCallId: "toolu_sub",
-      _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
+      _meta: {
+        anyharness: { nativeToolName: "Bash", parentToolCallId: "toolu_parent" },
+        claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
+      },
     });
-    // The request's claudeCode meta keeps the shape every other claudeCode
-    // meta has (toolName is required by ToolUpdateMeta).
+    // Tool-bearing metadata keeps its native name in both the provider-neutral
+    // and legacy namespaces (message-only parent metadata omits the name).
     expect(requests[0].toolCall._meta).toMatchObject({
+      anyharness: { nativeToolName: "Bash", parentToolCallId: "toolu_parent" },
       claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
     });
   });
 
-  it("omits the attribution (and logs the miss) when the agent id has no recorded parent", async () => {
+  it("keeps native identity but omits parent attribution when the agent id is unknown", async () => {
     const { agent, updates, requests, log } = setup();
 
     await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
@@ -2364,9 +2532,18 @@ describe("subagent permission attribution (issue #851)", () => {
       agentID: "agent-unknown",
     } as any);
 
-    const meta = updates[0].update._meta as { claudeCode?: { parentToolUseId?: string } };
-    expect(meta.claudeCode?.parentToolUseId).toBeUndefined();
-    expect(requests[0].toolCall._meta).toBeUndefined();
+    const updateMeta = updates[0].update._meta as {
+      anyharness?: { parentToolCallId?: string };
+      claudeCode?: { parentToolUseId?: string };
+    };
+    expect(updateMeta.anyharness?.parentToolCallId).toBeUndefined();
+    expect(updateMeta.claudeCode?.parentToolUseId).toBeUndefined();
+    expect(requests[0].toolCall._meta).toMatchObject({
+      anyharness: { nativeToolName: "Bash" },
+      claudeCode: { toolName: "Bash" },
+    });
+    expect((requests[0].toolCall._meta as any).anyharness.parentToolCallId).toBeUndefined();
+    expect((requests[0].toolCall._meta as any).claudeCode.parentToolUseId).toBeUndefined();
     // The task_id === agentID invariant is undocumented SDK behavior; a miss
     // must be observable so an SDK bump that breaks it doesn't regress silently.
     expect(log).toHaveBeenCalledWith(expect.stringContaining("agent-unknown"));
@@ -2395,7 +2572,10 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(notifications[0].update).toMatchObject({
       sessionUpdate: "tool_call_update",
       toolCallId: "toolu_sub",
-      _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
+      _meta: {
+        anyharness: { nativeToolName: "Bash", parentToolCallId: "toolu_parent" },
+        claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
+      },
     });
   });
 
@@ -5072,10 +5252,10 @@ describe("assembled assistant text fallback", () => {
     return { agent, updates };
   }
 
-  function messageStart(apiId: string) {
+  function messageStart(apiId: string, parentToolUseId: string | null = null) {
     return {
       type: "stream_event" as const,
-      parent_tool_use_id: null,
+      parent_tool_use_id: parentToolUseId,
       uuid: randomUUID(),
       session_id: "test-session",
       event: {
@@ -5085,10 +5265,10 @@ describe("assembled assistant text fallback", () => {
     };
   }
 
-  function textDelta(text: string) {
+  function textDelta(text: string, parentToolUseId: string | null = null) {
     return {
       type: "stream_event" as const,
-      parent_tool_use_id: null,
+      parent_tool_use_id: parentToolUseId,
       uuid: randomUUID(),
       session_id: "test-session",
       event: {
@@ -5099,10 +5279,10 @@ describe("assembled assistant text fallback", () => {
     };
   }
 
-  function thinkingDelta(thinking: string) {
+  function thinkingDelta(thinking: string, parentToolUseId: string | null = null) {
     return {
       type: "stream_event" as const,
-      parent_tool_use_id: null,
+      parent_tool_use_id: parentToolUseId,
       uuid: randomUUID(),
       session_id: "test-session",
       event: {
@@ -5275,8 +5455,8 @@ describe("assembled assistant text fallback", () => {
     // Production ordering captured with: inside a single message id, the
     // thinking block streams, THEN the SDK replays the user message that
     // activates the turn, THEN the text block streams. Turn activation runs
-    // `resetTurnScratch()`; if that nulls `currentStreamMessageId`, every text
-    // delta after the echo streams untracked, so the consolidated `assistant`
+    // `resetTurnScratch()`; if that clears the root stream lane, every text
+    // delta after the echo loses the pre-echo blocks, so the consolidated `assistant`
     // text fails dedupe and is re-emitted as a duplicate. #785 fixed the
     // stream-before-echo case but left this residual mid-message path.
     injectSessionEchoAt(agent, [
@@ -5369,7 +5549,7 @@ describe("assembled assistant text fallback", () => {
 
   it("dedupes a streamed text block even when an empty thinking delta precedes it", async () => {
     // An empty thinking delta (some gateways emit them — #793) must not create
-    // a zero-length streamedBlocks entry: that entry can never satisfy the
+    // a zero-length streamed-block entry: that entry can never satisfy the
     // consolidated handler's `text.length > 0` guard, so it would stall the
     // diff cursor and re-emit the real, already-streamed text as a duplicate.
     const { agent, updates } = createMockAgentWithCapture();
@@ -5405,14 +5585,14 @@ describe("assembled assistant text fallback", () => {
   });
 
   it("does not re-emit the next turn's text after a turn is cancelled mid-stream", async () => {
-    // Regression: streamedBlocks is reset inside the consolidated-assistant
+    // Regression: the root stream lane is reset inside the consolidated-assistant
     // branch, but a cancelled turn `break`s out before reaching it (the
-    // `if (session.cancelled) break;` guard), and streamedBlocks is
-    // session-scoped — so a cancelled turn's streamed text used to leak into
+    // `if (session.cancelled) break;` guard), and the lane is consumer-scoped —
+    // so a cancelled turn's streamed text used to leak into
     // the next turn. Block indices restart at 0 per message, so the leftover
     // "Hello there" would fuse with turn 2's first block and make its
     // consolidated copy fail the prefix dedupe, re-emitting "Second answer" as
-    // a duplicate. The fix resets streamedBlocks on each top-level
+    // a duplicate. The fix replaces the root lane on each top-level
     // `message_start`, bounding the record to one in-flight message.
     const { agent, updates } = createMockAgentWithCapture();
 
@@ -5428,16 +5608,16 @@ describe("assembled assistant text fallback", () => {
         yield userEcho(u1.value); // activate turn 1
         yield messageStart("msg-1");
         yield textDelta("Hello ");
-        yield textDelta("there"); // streamedBlocks = [{ index: 0, text: "Hello there" }]
+        yield textDelta("there"); // root lane = [{ index: 0, text: "Hello there" }]
         await cancelled; // hold until the test has cancelled turn 1
         // Turn 1's consolidated message arrives while cancelled → hits the
-        // `if (session.cancelled) break;` guard, skipping the streamedBlocks
+        // `if (session.cancelled) break;` guard, skipping the lane's
         // reset. The leftover entry must not survive into turn 2.
         yield assistantMessage("msg-1", [{ type: "text", text: "Hello there" }]);
         yield idle; // settles turn 1 as cancelled
         const u2 = await iter.next();
         yield userEcho(u2.value); // activate turn 2
-        yield messageStart("msg-2"); // resets streamedBlocks (the fix)
+        yield messageStart("msg-2"); // replaces the root lane (the fix)
         yield textDelta("Second answer");
         yield assistantMessage("msg-2", [{ type: "text", text: "Second answer" }]);
         yield result();
@@ -5473,25 +5653,500 @@ describe("assembled assistant text fallback", () => {
     ]);
   });
 
-  it("does not leak subagent assistant text into the top-level feed", async () => {
+  it("surfaces assembled child prose and reasoning only under its native parent", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    // Subagent assistant messages (parent_tool_use_id !== null) are never
-    // streamed live; their text/thinking is internal to the tool call and must
-    // stay filtered out, not surface as a fallback chunk.
     injectSession(agent, [
       assistantMessage(
         "msg-subagent",
-        [{ type: "text", text: "subagent internal prose" }],
+        [
+          { type: "thinking", thinking: "child reasoning" },
+          { type: "text", text: "subagent internal prose" },
+        ],
         "tool_use_1",
       ),
+      // A zero-token result fallback is still the root answer. Child prose must
+      // not set emittedAssistantText and suppress it.
+      { ...result(), result: "root fallback" },
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["subagent internal prose", "root fallback"]);
+    expect(thoughtChunkTexts(updates)).toEqual(["child reasoning"]);
+
+    for (const text of ["subagent internal prose", "child reasoning"]) {
+      const child = updates.find((update) => update.update?.content?.text === text);
+      expect(child.update).toMatchObject({
+        messageId: "msg-subagent",
+        _meta: {
+          anyharness: { parentToolCallId: "tool_use_1" },
+          claudeCode: { parentToolUseId: "tool_use_1" },
+        },
+      });
+    }
+    const root = updates.find((update) => update.update?.content?.text === "root fallback");
+    expect(root.update._meta?.anyharness?.parentToolCallId).toBeUndefined();
+    expect(root.update._meta?.claudeCode?.parentToolUseId).toBeUndefined();
+  });
+
+  it("keeps message identity and dedupe isolated across interleaved root and child streams", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      messageStart("msg-root"),
+      textDelta("root "),
+      messageStart("msg-child-a", "tool_use_a"),
+      textDelta("alpha ", "tool_use_a"),
+      messageStart("msg-child-b", "tool_use_b"),
+      textDelta("beta", "tool_use_b"),
+      textDelta("answer"),
+      textDelta("done", "tool_use_a"),
+      assistantMessage("msg-child-b", [{ type: "text", text: "beta" }], "tool_use_b"),
+      assistantMessage("msg-child-a", [{ type: "text", text: "alpha done" }], "tool_use_a"),
+      assistantMessage("msg-root", [{ type: "text", text: "root answer" }]),
       result(),
       idle,
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
 
-    expect(messageChunkTexts(updates)).toEqual([]);
-    expect(thoughtChunkTexts(updates)).toEqual([]);
+    const chunks = updates.filter(
+      (update) => update.update?.sessionUpdate === "agent_message_chunk",
+    );
+    expect(chunks.map((update) => update.update.content.text)).toEqual([
+      "root ",
+      "alpha ",
+      "beta",
+      "answer",
+      "done",
+    ]);
+    expect(chunks.map((update) => update.update.messageId)).toEqual([
+      "msg-root",
+      "msg-child-a",
+      "msg-child-b",
+      "msg-root",
+      "msg-child-a",
+    ]);
+    expect(
+      chunks.map((update) => update.update._meta?.anyharness?.parentToolCallId ?? null),
+    ).toEqual([null, "tool_use_a", "tool_use_b", null, "tool_use_a"]);
+    expect(
+      chunks.map((update) => update.update._meta?.claudeCode?.parentToolUseId ?? null),
+    ).toEqual([null, "tool_use_a", "tool_use_b", null, "tool_use_a"]);
+  });
+
+  it("forwards only a cut-short child stream's assembled tail with parent identity", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      messageStart("msg-child-partial", "tool_use_1"),
+      textDelta("nested ", "tool_use_1"),
+      assistantMessage("msg-child-partial", [{ type: "text", text: "nested work" }], "tool_use_1"),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const chunks = updates.filter(
+      (update) => update.update?.sessionUpdate === "agent_message_chunk",
+    );
+    expect(chunks.map((update) => update.update.content.text)).toEqual(["nested ", "work"]);
+    for (const chunk of chunks) {
+      expect(chunk.update).toMatchObject({
+        messageId: "msg-child-partial",
+        _meta: {
+          anyharness: { parentToolCallId: "tool_use_1" },
+          claudeCode: { parentToolUseId: "tool_use_1" },
+        },
+      });
+    }
+  });
+
+  it("bounds lost-bookend child lanes across autonomous cycles without a new prompt", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const orphanParents = ["toolu_orphan_1", "toolu_orphan_2", "toolu_orphan_3"];
+    const taskStarted = (taskId: string, parentToolUseId: string) => ({
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      tool_use_id: parentToolUseId,
+      description: "Explore",
+      subagent_type: "Explore",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const backgroundLevel = (taskIds: string[]) => ({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: taskIds.map((task_id) => ({
+        task_id,
+        task_type: "local_agent",
+        description: "Explore",
+      })),
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const autonomousResult = () => ({
+      ...result(),
+      origin: { kind: "task-notification" },
+    });
+
+    // Settle the one ACP prompt first. Everything after this point is driven by
+    // the persistent consumer; the generator never requests another input.
+    const messages: any[] = [result(), idle];
+    orphanParents.forEach((parentToolUseId, index) => {
+      const taskId = `agent-orphan-${index + 1}`;
+      messages.push(
+        taskStarted(taskId, parentToolUseId),
+        backgroundLevel([taskId]),
+        messageStart(`msg-orphan-${index + 1}`, parentToolUseId),
+        textDelta(`orphan ${index + 1}`, parentToolUseId),
+        // The consolidated assistant and terminal task frames are lost. The
+        // cycle result arms the lane; the first later empty level starts its
+        // grace, and the next level that still omits it retires the lane without
+        // a new foreground activation.
+        autonomousResult(),
+        backgroundLevel([]),
+        idle,
+      );
+    });
+
+    const liveTaskId = "agent-live";
+    const liveParent = "toolu_live";
+    messages.push(
+      taskStarted(liveTaskId, liveParent),
+      backgroundLevel([liveTaskId]),
+      messageStart("msg-live", liveParent),
+      textDelta("live prefix ", liveParent),
+      autonomousResult(),
+      // A racing payload built before registration can omit a still-live task
+      // even after the result. The first absence is only a candidate; the
+      // corrective inclusive level must reset it and preserve prefix dedupe.
+      backgroundLevel([]),
+      backgroundLevel([liveTaskId]),
+      assistantMessage("msg-live", [{ type: "text", text: "live prefix tail" }], liveParent),
+      {
+        type: "system",
+        subtype: "task_notification",
+        task_id: liveTaskId,
+        tool_use_id: liveParent,
+        status: "completed",
+        output_file: "",
+        summary: "done",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      backgroundLevel([]),
+      idle,
+    );
+
+    const setSpy = vi.spyOn(Map.prototype, "set");
+    try {
+      injectSession(agent, messages);
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      await agent.sessions["test-session"]?.consumer;
+
+      const streamLaneSetIndex = setSpy.mock.calls.findIndex(
+        ([key, value]) =>
+          key === orphanParents[0] &&
+          typeof value === "object" &&
+          value !== null &&
+          "blocks" in value,
+      );
+      expect(streamLaneSetIndex).toBeGreaterThanOrEqual(0);
+      const streamLaneMap = setSpy.mock.contexts[streamLaneSetIndex] as Map<string, unknown>;
+      expect(orphanParents.filter((parent) => streamLaneMap.has(parent))).toEqual([]);
+      expect(agent.sessions["test-session"]!.liveBackgroundTasks.size).toBe(0);
+    } finally {
+      setSpy.mockRestore();
+    }
+
+    const chunks = updates.filter(
+      (update) => update.update?.sessionUpdate === "agent_message_chunk",
+    );
+    expect(chunks.map((update) => update.update.content.text)).toEqual([
+      "orphan 1",
+      "orphan 2",
+      "orphan 3",
+      "live prefix ",
+      "tail",
+    ]);
+    expect(chunks.map((update) => update.update.messageId)).toEqual([
+      "msg-orphan-1",
+      "msg-orphan-2",
+      "msg-orphan-3",
+      "msg-live",
+      "msg-live",
+    ]);
+    expect(chunks.map((update) => update.update._meta?.anyharness?.parentToolCallId)).toEqual([
+      ...orphanParents,
+      liveParent,
+      liveParent,
+    ]);
+  });
+
+  it("caps quiescent child lanes across unmapped and synchronous no-level cycles", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const hardCap = 32;
+    const burstParents = Array.from({ length: 40 }, (_, i) => `toolu_unmapped_burst_${i}`);
+    const agedParents = Array.from({ length: 12 }, (_, i) => `toolu_unmapped_age_${i}`);
+    const boundedParents = [...burstParents, ...agedParents];
+    const protectedTaskId = "agent-confirmed-live";
+    const protectedParent = "toolu_confirmed_live";
+    const autonomousResult = () => ({
+      ...result(),
+      origin: { kind: "task-notification" },
+    });
+    const synchronousTaskStarted = (index: number) => ({
+      type: "system",
+      subtype: "task_started",
+      task_id: `agent-unmapped-age-${index}`,
+      tool_use_id: agedParents[index],
+      description: "Synchronous explore",
+      subagent_type: "Explore",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+
+    let markCapProcessed!: () => void;
+    const capProcessed = new Promise<void>((resolve) => {
+      markCapProcessed = resolve;
+    });
+    let releaseAfterCap!: () => void;
+    const afterCap = new Promise<void>((resolve) => {
+      releaseAfterCap = resolve;
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield result(); // settle the only ACP prompt
+        yield idle;
+
+        // Root reconciliation is never an eviction candidate, even while an
+        // autonomous process cycles through many orphaned child streams.
+        yield messageStart("msg-bounded-root");
+        yield textDelta("root prefix ");
+
+        // One mapped task is authoritatively live in the latest background
+        // level. It must remain protected through both the cap and >8 results.
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: protectedTaskId,
+          tool_use_id: protectedParent,
+          description: "Background explore",
+          subagent_type: "Explore",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [
+            {
+              task_id: protectedTaskId,
+              task_type: "local_agent",
+              description: "Background explore",
+            },
+          ],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield messageStart("msg-confirmed-live", protectedParent);
+        yield textDelta("live prefix ", protectedParent);
+
+        // No task_started, task terminal, background_tasks_changed, or
+        // consolidated assistant frames exist for these children. One result
+        // arms all 40 at once and must immediately enforce the hard cap of 32.
+        for (let i = 0; i < burstParents.length; i++) {
+          yield messageStart(`msg-unmapped-burst-${i}`, burstParents[i]);
+          yield textDelta(`burst ${i} `, burstParents[i]);
+        }
+        yield autonomousResult();
+        // The generator resumes only after the consumer processed the result,
+        // so the test can snapshot hard-cap deletions before aging begins.
+        markCapProcessed();
+        await afterCap;
+        yield idle;
+
+        // Reusing an evicted parent starts a fresh lane and message identity;
+        // the discarded prefix cache cannot poison its new reconciliation.
+        yield messageStart("msg-unmapped-recreated", burstParents[0]);
+        yield textDelta("recreated ", burstParents[0]);
+        yield assistantMessage(
+          "msg-unmapped-recreated",
+          [{ type: "text", text: "recreated tail" }],
+          burstParents[0],
+        );
+
+        // Repeated mapped synchronous/no-level lost-bookend cycles exercise the
+        // result-age path: task_started exists, but no terminal or background
+        // level ever follows. The first quiescent generation is preserved
+        // across results, so mapped-but-unconfirmed stale lanes still age.
+        for (let i = 0; i < agedParents.length; i++) {
+          yield synchronousTaskStarted(i);
+          yield messageStart(`msg-unmapped-age-${i}`, agedParents[i]);
+          yield textDelta(`aged ${i} `, agedParents[i]);
+          yield autonomousResult();
+          yield idle;
+        }
+
+        // The newest unconfirmed lane is still within the age/bound budget and
+        // retains normal prefix/tail reconciliation.
+        yield assistantMessage(
+          `msg-unmapped-age-${agedParents.length - 1}`,
+          [{ type: "text", text: `aged ${agedParents.length - 1} tail` }],
+          agedParents[agedParents.length - 1],
+        );
+
+        // One racing omission must retain the two-level grace even though the
+        // lane is already older than the age limit and the intervening result
+        // also enforces the cap. The corrective inclusive level proves it is
+        // still live, so consolidation must emit only the unstreamed tail.
+        yield {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield autonomousResult();
+        yield {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [
+            {
+              task_id: protectedTaskId,
+              task_type: "local_agent",
+              description: "Background explore",
+            },
+          ],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield assistantMessage(
+          "msg-confirmed-live",
+          [{ type: "text", text: "live prefix tail" }],
+          protectedParent,
+        );
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: protectedTaskId,
+          tool_use_id: protectedParent,
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+
+        // Later stream activity likewise disarms a quiescent lane and keeps its
+        // original message identity until consolidation.
+        const activeParent = "toolu_unmapped_active";
+        yield messageStart("msg-unmapped-active", activeParent);
+        yield textDelta("active ", activeParent);
+        yield autonomousResult();
+        yield textDelta("continued ", activeParent); // disarms result aging
+        yield assistantMessage(
+          "msg-unmapped-active",
+          [{ type: "text", text: "active continued tail" }],
+          activeParent,
+        );
+        yield idle;
+
+        yield assistantMessage("msg-bounded-root", [{ type: "text", text: "root prefix tail" }]);
+      }
+      return messageGenerator();
+    });
+
+    const setSpy = vi.spyOn(Map.prototype, "set");
+    let streamLaneMap: Map<string, unknown> | undefined;
+    try {
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      await capProcessed;
+      const streamLaneSetIndex = setSpy.mock.calls.findIndex(
+        ([key, value]) =>
+          key === burstParents[0] &&
+          typeof value === "object" &&
+          value !== null &&
+          "blocks" in value,
+      );
+      expect(streamLaneSetIndex).toBeGreaterThanOrEqual(0);
+      streamLaneMap = setSpy.mock.contexts[streamLaneSetIndex] as Map<string, unknown>;
+      expect(burstParents.filter((parent) => streamLaneMap!.has(parent))).toEqual(
+        burstParents.slice(8),
+      );
+      expect(streamLaneMap.has("")).toBe(true);
+      expect(streamLaneMap.has(protectedParent)).toBe(true);
+      releaseAfterCap();
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(
+        boundedParents.filter((parent) => streamLaneMap!.has(parent)).length,
+      ).toBeLessThanOrEqual(hardCap);
+      expect(streamLaneMap.has(agedParents[0])).toBe(false);
+    } finally {
+      releaseAfterCap();
+      setSpy.mockRestore();
+    }
+
+    // Eviction never weakens live delivery: all prefixes were already sent.
+    for (let i = 0; i < burstParents.length; i++) {
+      expect(
+        updates.some(
+          (update) =>
+            update.update?.messageId === `msg-unmapped-burst-${i}` &&
+            update.update?.content?.text === `burst ${i} `,
+        ),
+      ).toBe(true);
+    }
+
+    const chunksFor = (messageId: string) =>
+      updates
+        .filter((update) => update.update?.messageId === messageId)
+        .map((update) => update.update.content?.text)
+        .filter((text): text is string => typeof text === "string");
+    expect(chunksFor(`msg-unmapped-age-${agedParents.length - 1}`)).toEqual([
+      `aged ${agedParents.length - 1} `,
+      "tail",
+    ]);
+    expect(chunksFor("msg-confirmed-live")).toEqual(["live prefix ", "tail"]);
+    expect(chunksFor("msg-unmapped-recreated")).toEqual(["recreated ", "tail"]);
+    expect(chunksFor("msg-unmapped-active")).toEqual(["active ", "continued ", "tail"]);
+    expect(chunksFor("msg-bounded-root")).toEqual(["root prefix ", "tail"]);
+  });
+
+  it("keeps child tool progress nested with provider-neutral native metadata", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "tool_progress",
+        tool_use_id: "toolu_child_bash",
+        tool_name: "Bash",
+        parent_tool_use_id: "toolu_agent",
+        elapsed_time_seconds: 3,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const progress = updates.find((update) => update.update?.toolCallId === "toolu_child_bash");
+    expect(progress.update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      status: "in_progress",
+      _meta: {
+        anyharness: { nativeToolName: "Bash", parentToolCallId: "toolu_agent" },
+        claudeCode: { toolName: "Bash", parentToolUseId: "toolu_agent" },
+      },
+    });
   });
 
   it("forwards distinct blocks that a gateway splits across same-id messages", async () => {
@@ -5517,10 +6172,10 @@ describe("assembled assistant text fallback", () => {
 
   it("re-forwards a block a gateway re-delivers (no content-keyed dedupe)", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    // The fallback intentionally keys only on whether the id streamed live, not
-    // on block content — so a gateway re-delivering the same assembled block
-    // emits it twice. This is the accepted, cosmetic tradeoff for not caching
-    // every fallback block's full text; see `streamedTextMessageIds`.
+    // The fallback intentionally records only in-flight streamed blocks, not
+    // every assembled-only block in session history. A gateway that re-delivers
+    // the same assembled block therefore emits it twice — the accepted cosmetic
+    // tradeoff for bounded dedupe state.
     injectSession(agent, [
       assistantMessage("msg-dup", [{ type: "text", text: "answer" }]),
       assistantMessage("msg-dup", [{ type: "text", text: "answer" }]),
@@ -10154,6 +10809,43 @@ describe("toAcpNotifications messageId", () => {
     );
     expect(result[0].update.sessionUpdate).toBe("tool_call");
     expect(result[0].update).not.toHaveProperty("messageId");
+  });
+});
+
+describe("AnyHarness native tool metadata", () => {
+  function toolCall(toolName: string, parentToolUseId?: string) {
+    return toAcpNotifications(
+      [{ type: "tool_use", id: `toolu_${toolName}`, name: toolName, input: {} }],
+      "assistant",
+      "test",
+      {},
+      {} as AcpClient,
+      console,
+      { registerHooks: false, parentToolUseId },
+    )[0].update;
+  }
+
+  it.each(["Agent", "Task"])(
+    "classifies the native %s tool as a provider-neutral subagent",
+    (toolName) => {
+      expect(toolCall(toolName)).toMatchObject({
+        _meta: {
+          anyharness: { nativeToolName: toolName, toolKind: "subagent" },
+          claudeCode: { toolName },
+        },
+      });
+    },
+  );
+
+  it("keeps ordinary child tools nested without misclassifying their kind", () => {
+    const update = toolCall("Bash", "toolu_agent");
+    expect(update).toMatchObject({
+      _meta: {
+        anyharness: { nativeToolName: "Bash", parentToolCallId: "toolu_agent" },
+        claudeCode: { toolName: "Bash", parentToolUseId: "toolu_agent" },
+      },
+    });
+    expect((update._meta as any).anyharness).not.toHaveProperty("toolKind");
   });
 });
 
