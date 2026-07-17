@@ -1191,12 +1191,19 @@ export const createPostToolUseHook =
       /** Reports the session transcript path carried on hook input. */
       onTranscriptPath?: (transcriptPath: string) => void;
       /** Observes native cron tool executions for LoopPort bookkeeping. */
-      onCronTool?: (toolName: string, toolInput: unknown, toolResponse: unknown) => Promise<void>;
+      onCronTool?: (
+        toolName: string,
+        toolInput: unknown,
+        toolResponse: unknown,
+        origin: { promptId?: string; agentId?: string },
+      ) => Promise<void>;
     },
   ): HookCallback =>
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PostToolUse") {
-      if (typeof input.transcript_path === "string") {
+      // A subagent hook reports the child JSONL path. Only the main thread may
+      // establish the session's parent transcript tailer.
+      if (!input.agent_id && typeof input.transcript_path === "string") {
         options?.onTranscriptPath?.(input.transcript_path);
       }
 
@@ -1211,7 +1218,10 @@ export const createPostToolUseHook =
           input.tool_name === "CronList") &&
         options?.onCronTool
       ) {
-        await options.onCronTool(input.tool_name, input.tool_input, input.tool_response);
+        await options.onCronTool(input.tool_name, input.tool_input, input.tool_response, {
+          promptId: typeof input.prompt_id === "string" ? input.prompt_id : undefined,
+          agentId: typeof input.agent_id === "string" ? input.agent_id : undefined,
+        });
       }
 
       if (toolUseID) {

@@ -19,7 +19,14 @@ export const ANYHARNESS_CAPABILITIES = {
 } as const;
 
 export type AnyharnessTranscriptEvent =
-  "goal_updated" | "goal_cleared" | "goal_met" | "loop_updated" | "loop_fired" | "loop_cleared";
+  | "goal_updated"
+  | "goal_cleared"
+  | "goal_met"
+  | "loop_upserted"
+  | "loop_fired"
+  | "loop_removed"
+  | "process_upserted"
+  | "subagent_upserted";
 
 export type GoalWireStatus = "active" | "paused" | "blocked" | "met" | "failed" | "cleared";
 
@@ -69,6 +76,8 @@ export type LoopState = {
   status: "active" | "cleared";
   lastFiredAtMs: number | null;
   fireCount: number;
+  /** Internal attribution floor; intentionally omitted from LoopWire. */
+  createdAtMs: number;
   updatedAtMs: number;
 };
 
@@ -77,8 +86,91 @@ export type PendingLoopSet = {
   schedule: LoopSchedule;
   recurring: boolean;
   requestedAtMs: number;
+  injectionUuid?: string;
+  provisionalLoopId?: string;
+  clearRequested?: boolean;
   resolve: (loop: LoopState) => void;
+  fail: () => void;
 };
+
+/** Canonical ActivityPort feed transport understood by the current runtime. */
+export type FeedTransport = { kind: "tail_file"; path: string };
+
+export type ProcessWire = {
+  id: string;
+  command: string;
+  cwd: string | null;
+  status: "running" | "exited";
+  exitCode: number | null;
+  pid: number | null;
+  startedAtMs: number;
+  endedAtMs: number | null;
+  feed: FeedTransport | null;
+};
+
+/** Internal process record carrying the task/tool correlation only. */
+export type ProcessState = ProcessWire & {
+  toolUseId: string | null;
+};
+
+export type SubagentWire = {
+  id: string;
+  agentType: string | null;
+  description: string | null;
+  model: string | null;
+  background: boolean;
+  status: "running" | "completed" | "failed";
+  summary: string | null;
+  tokensUsed: number | null;
+  toolCalls: number | null;
+  durationSeconds: number | null;
+  feed: FeedTransport | null;
+};
+
+export type SubagentState = SubagentWire;
+
+/** Bounded correlation record for a Bash tool use that may become a task. */
+export type TaskToolUse = {
+  command?: string;
+  outputFile?: string;
+};
+
+/** A native loop command held until the persistent consumer reaches idle. */
+export type DeferredLoopInjection = {
+  uuid: string;
+  text: string;
+  loopId: string;
+};
+
+export function processWireFromState(state: ProcessState): ProcessWire {
+  return {
+    id: state.id,
+    command: state.command,
+    cwd: state.cwd,
+    status: state.status,
+    exitCode: state.exitCode,
+    pid: state.pid,
+    startedAtMs: state.startedAtMs,
+    endedAtMs: state.endedAtMs,
+    feed: state.feed,
+  };
+}
+
+export function subagentWireFromState(state: SubagentState): SubagentWire {
+  return {
+    id: state.id,
+    agentType: state.agentType,
+    description: state.description,
+    model: state.model,
+    background: state.background,
+    status: state.status,
+    summary: state.summary,
+    tokensUsed: state.tokensUsed,
+    toolCalls: state.toolCalls,
+    durationSeconds: state.durationSeconds,
+    feed: state.feed,
+  };
+}
 
 /** Per-session goal/loop bookkeeping, attached to the ACP Session. */
 export type AnyharnessSessionState = {
@@ -90,6 +182,19 @@ export type AnyharnessSessionState = {
   pendingLoopSets: PendingLoopSet[];
   /** Watchers resolved whenever a loop transitions to cleared. */
   loopClearWatchers: (() => void)[];
+  /** Old provisional id -> real native id, for clears racing reconciliation. */
+  loopAliases: Map<string, string>;
+  /** Read-only activity rosters keyed by Claude task id. */
+  processes: Map<string, ProcessState>;
+  subagents: Map<string, SubagentState>;
+  /** Bounded Bash tool-use correlation awaiting task lifecycle events. */
+  taskToolUse: Map<string, TaskToolUse>;
+  /** Native /loop commands waiting for a true idle boundary. */
+  deferredLoopInjections: DeferredLoopInjection[];
+  /** One native loop command has been pushed and has not reached its result. */
+  loopInjectionInFlight: boolean;
+  /** UUID of that command, for exact result/lifecycle cleanup. */
+  loopInjectionUuid: string | null;
   /** UUIDs of user messages injected by the GoalPort/LoopPort bridge. */
   injectedUuids: Set<string>;
   transcriptPath: string | null;
@@ -105,6 +210,13 @@ export function newAnyharnessSessionState(tailFromStart: boolean): AnyharnessSes
     loops: new Map(),
     pendingLoopSets: [],
     loopClearWatchers: [],
+    loopAliases: new Map(),
+    processes: new Map(),
+    subagents: new Map(),
+    taskToolUse: new Map(),
+    deferredLoopInjections: [],
+    loopInjectionInFlight: false,
+    loopInjectionUuid: null,
     injectedUuids: new Set(),
     transcriptPath: null,
     tailer: null,
@@ -143,6 +255,80 @@ export function loopWireFromState(state: LoopState): LoopWire {
 
 export function activeLoops(state: AnyharnessSessionState): LoopState[] {
   return [...state.loops.values()].filter((loop) => loop.status === "active");
+}
+
+/** Match an authoritative native-cron prompt without guessing between candidates. */
+export function matchLoopForWake(loops: LoopState[], userText: string): LoopState | undefined {
+  const exact = loops.filter((loop) => loop.prompt === userText);
+  return exact.length === 1 ? exact[0] : undefined;
+}
+
+function searchableToolResponse(toolResponse: unknown): string {
+  if (typeof toolResponse === "string") {
+    return toolResponse;
+  }
+  if (Array.isArray(toolResponse)) {
+    return toolResponse
+      .map((block) =>
+        typeof block === "object" &&
+        block !== null &&
+        typeof (block as { text?: unknown }).text === "string"
+          ? (block as { text: string }).text
+          : "",
+      )
+      .join("\n");
+  }
+  if (typeof toolResponse === "object" && toolResponse !== null) {
+    const content = (toolResponse as { content?: unknown }).content;
+    if (typeof content === "string" || Array.isArray(content)) {
+      return searchableToolResponse(content);
+    }
+    try {
+      return JSON.stringify(toolResponse);
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+/** Claude's CronCreate result is prose: `Scheduled recurring job <id> ...`. */
+export function parseCronIdFromResult(toolResponse: unknown): string | null {
+  const match = searchableToolResponse(toolResponse).match(/\bjob\s+([A-Za-z0-9_-]{4,})/i);
+  return match?.[1] ?? null;
+}
+
+/** The live per-subagent JSONL path derived from its parent session transcript. */
+export function subagentFeedPath(
+  parentTranscriptPath: string,
+  sessionId: string,
+  taskId: string,
+): string {
+  return path.join(
+    path.dirname(parentTranscriptPath),
+    sessionId,
+    "subagents",
+    `agent-${taskId}.jsonl`,
+  );
+}
+
+/** Parse the output path from Claude's background-Bash result text. */
+export function parseBackgroundOutputFile(toolResult: unknown): string | null {
+  const text = searchableToolResponse(toolResult);
+  if (!text) {
+    return null;
+  }
+  for (const pattern of [
+    /(?:written|writing|logged|logging)\s+to:?\s*(\S+)/i,
+    /logs?\s+to:?\s*(\S+)/i,
+    /output(?:\s+file)?\s*(?:→|->|:)\s*(\S+)/i,
+  ]) {
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return match[1].replace(/[.,)]+$/, "");
+    }
+  }
+  return null;
 }
 
 /** Shape of a `goal_status` attachment persisted in the session transcript. */
@@ -202,6 +388,37 @@ export function extractGoalStatus(row: unknown): GoalStatusRow | null {
     return candidate;
   }
   return null;
+}
+
+/** Extract the authoritative dequeued native-cron prompt from a transcript row. */
+export function extractCronFirePrompt(row: unknown): string | null {
+  if (typeof row !== "object" || row === null) {
+    return null;
+  }
+  const candidate = row as {
+    type?: unknown;
+    isMeta?: unknown;
+    promptSource?: unknown;
+    timestamp?: unknown;
+    message?: { role?: unknown; content?: unknown };
+  };
+  const timestampMs =
+    typeof candidate.timestamp === "string" ? Date.parse(candidate.timestamp) : Number.NaN;
+  if (
+    candidate.type !== "user" ||
+    candidate.isMeta !== true ||
+    candidate.promptSource !== "sdk" ||
+    candidate.message?.role !== "user" ||
+    !Number.isFinite(timestampMs)
+  ) {
+    return null;
+  }
+  const content = candidate.message?.content;
+  if (typeof content !== "string") {
+    return null;
+  }
+  const text = content.trim();
+  return text.length > 0 ? text : null;
 }
 
 /** Fallback transcript path when no hook has reported transcript_path yet. */

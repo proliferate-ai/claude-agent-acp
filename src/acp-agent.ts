@@ -113,6 +113,7 @@ import {
   AnyharnessTranscriptEvent,
   classifyGoalStatus,
   computeTranscriptPath,
+  extractCronFirePrompt,
   extractGoalStatus,
   GoalStatusRow,
   GoalWire,
@@ -121,8 +122,19 @@ import {
   LoopState,
   LoopWire,
   loopWireFromState,
+  matchLoopForWake,
   newAnyharnessSessionState,
+  parseBackgroundOutputFile,
+  parseCronIdFromResult,
+  PendingLoopSet,
+  ProcessState,
+  ProcessWire,
+  processWireFromState,
   readLastGoalStatus,
+  subagentFeedPath,
+  SubagentState,
+  SubagentWire,
+  subagentWireFromState,
   TranscriptTailer,
 } from "./anyharness.js";
 import { SettingsManager } from "./settings.js";
@@ -946,34 +958,16 @@ const GOAL_CLEAR_TIMEOUT_MS = 30_000;
 const LOOP_SET_TIMEOUT_MS = 60_000;
 const LOOP_CLEAR_TIMEOUT_MS = 60_000;
 
+/** Prevent foreground Bash calls that never become tasks from growing the
+ * activity correlation cache for the lifetime of a persistent session. */
+const MAX_ACTIVITY_TASK_TOOL_USES = 64;
+
 function safeJson(value: unknown): string {
   try {
     return JSON.stringify(value) ?? String(value);
   } catch {
     return String(value);
   }
-}
-
-/** Extract plain user text when attributing an idle native loop wake. */
-function userMessageText(content: unknown): string | undefined {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    const texts = content
-      .filter(
-        (block): block is { type: "text"; text: string } =>
-          typeof block === "object" &&
-          block !== null &&
-          block.type === "text" &&
-          typeof block.text === "string",
-      )
-      .map((block) => block.text);
-    if (texts.length > 0) {
-      return texts.join("\n");
-    }
-  }
-  return undefined;
 }
 
 /** Best-effort extraction of the native cron id from Cron tool input/output. */
@@ -1907,43 +1901,15 @@ export class ClaudeAcpAgent {
     // instructions and native loop wakes share the persistent consumer with
     // user turns in v0.59; keeping this consumer-local replaces the fork's
     // now-obsolete separate idle pump while preserving its attribution rules.
-    let anyharnessTurnKind: "unknown" | "injected" | "wake" | "plain" = "unknown";
-    const markAnyharnessSpontaneousTurn = async (userText?: string) => {
+    let anyharnessTurnKind: "unknown" | "injected" | "loop_injected" | "plain" = "unknown";
+    const markAnyharnessSpontaneousTurn = () => {
       if (session.activeTurn || anyharnessTurnKind !== "unknown") {
         return;
       }
-      const loops = activeLoops(session.anyharness);
-      if (loops.length === 0) {
-        anyharnessTurnKind = "plain";
-        return;
-      }
-      let loop: LoopState | undefined;
-      if (userText) {
-        loop = loops.find(
-          (candidate) => userText.includes(candidate.prompt) || candidate.prompt.includes(userText),
-        );
-        if (!loop) {
-          // A non-matching user echo may be an ACP prompt whose activation is
-          // handled below; wait for stronger evidence instead of misfiring.
-          return;
-        }
-      } else {
-        loop = loops[0];
-        if (loops.length > 1) {
-          this.logger.error(
-            `[anyharness] ambiguous cron wake (${loops.length} loops armed); attributing to ${loop.loopId}`,
-          );
-        }
-      }
-      anyharnessTurnKind = "wake";
-      const now = Date.now();
-      loop.fireCount += 1;
-      loop.lastFiredAtMs = now;
-      loop.updatedAtMs = now;
-      await this.sendAnyharnessEvent(params.sessionId, "loop_fired", {
-        loop: loopWireFromState(loop),
-        loopId: loop.loopId,
-      });
+      // Native cron wakes do not identify themselves on the SDK stream. Mark
+      // the cycle autonomous here, but attribute loop fires only from the
+      // authoritative dequeued-prompt row in the transcript tailer.
+      anyharnessTurnKind = "plain";
     };
     /** The consumer's single send chokepoint: every `sessionUpdate` in this
      *  loop goes through here (never `this.client.sessionUpdate` directly) so
@@ -2493,6 +2459,8 @@ export class ClaudeAcpAgent {
             case "completed":
             case "discarded":
             case "cancelled": {
+              session.anyharness.injectedUuids.delete(frame.command_uuid);
+              this.finishLoopInjection(params.sessionId, session, frame.command_uuid);
               // Terminal frames. Latch the fate on a still-queued turn so a
               // later cancel() doesn't seed an orphan entry for a command
               // whose one-and-only terminal frame has already been consumed
@@ -2739,6 +2707,7 @@ export class ClaudeAcpAgent {
                   // signal, so it's the point at which a new title may have
                   // landed. Push it to the client if it changed.
                   await this.maybeUpdateSessionTitle(params.sessionId, session);
+                  this.tryFlushDeferredLoopInjection(params.sessionId, session);
                 }
                 break;
               }
@@ -2872,7 +2841,9 @@ export class ClaudeAcpAgent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
+                break;
               case "task_progress":
+                this.handleActivityTaskEvent(params.sessionId, message);
                 break;
               case "task_started":
                 // For subagent tasks `task_id` is the subagent's agent id (the
@@ -2897,6 +2868,7 @@ export class ClaudeAcpAgent {
                   parentToolUseId: message.tool_use_id,
                   isSubagent: !!message.subagent_type,
                 });
+                this.handleActivityTaskEvent(params.sessionId, message, liveBackgroundTaskIds);
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
                 }
@@ -2905,6 +2877,7 @@ export class ClaudeAcpAgent {
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry and interrupted transcript
                 // lane can be dropped together.
+                this.handleActivityTaskEvent(params.sessionId, message);
                 forgetLiveBackgroundTask(message.task_id, message.tool_use_id);
                 break;
               case "task_updated":
@@ -2913,6 +2886,7 @@ export class ClaudeAcpAgent {
                 // guaranteed per transition — prune on it too so the registry
                 // can't grow for the session's lifetime if a notification is
                 // skipped.
+                this.handleActivityTaskEvent(params.sessionId, message);
                 if (
                   message.patch.status === "completed" ||
                   message.patch.status === "failed" ||
@@ -3025,6 +2999,7 @@ export class ClaudeAcpAgent {
                 // race after the result without irreversibly deleting a lane
                 // before the corrective inclusive level arrives.
                 backgroundLevelGeneration++;
+                this.reconcileActivityBackgroundFlags(params.sessionId, message.tasks);
                 const live = new Set(message.tasks.map((t) => t.task_id));
                 liveBackgroundTaskIds = live;
                 if (session.liveBackgroundTasks.size > 0) {
@@ -3419,13 +3394,23 @@ export class ClaudeAcpAgent {
                 session.emittedAssistantText = false;
               }
               if (isAnyharnessAutonomousResult) {
+                if (
+                  anyharnessTurnKind === "loop_injected" &&
+                  session.anyharness.loopInjectionUuid
+                ) {
+                  this.finishLoopInjection(
+                    params.sessionId,
+                    session,
+                    session.anyharness.loopInjectionUuid,
+                  );
+                }
                 anyharnessTurnKind = "unknown";
               }
             }
             break;
           }
           case "stream_event": {
-            await markAnyharnessSpontaneousTurn();
+            markAnyharnessSpontaneousTurn();
             const streamParentKey = message.parent_tool_use_id ?? "";
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow (whose delta events don't carry
@@ -3553,6 +3538,7 @@ export class ClaudeAcpAgent {
           }
           case "user":
           case "assistant": {
+            this.captureActivityTaskIo(params.sessionId, message);
             // Record the ACP messageId -> SDK uuid mapping for this message
             // (including replays). The consolidated message carries both ids, so
             // this is where we learn the uuid the SDK's rewind/resume APIs key on
@@ -3571,7 +3557,10 @@ export class ClaudeAcpAgent {
             if (message.type === "user" && "uuid" in message && message.uuid) {
               const injected = session.anyharness.injectedUuids.delete(message.uuid);
               if (injected) {
-                anyharnessTurnKind = "injected";
+                anyharnessTurnKind =
+                  message.uuid === session.anyharness.loopInjectionUuid
+                    ? "loop_injected"
+                    : "injected";
               }
               const queued = findUnsettledTurn(message.uuid);
               if (queued) {
@@ -3631,8 +3620,12 @@ export class ClaudeAcpAgent {
               }
             }
 
-            if (message.type === "user" && anyharnessTurnKind !== "injected") {
-              await markAnyharnessSpontaneousTurn(userMessageText(message.message.content));
+            if (
+              message.type === "user" &&
+              anyharnessTurnKind !== "injected" &&
+              anyharnessTurnKind !== "loop_injected"
+            ) {
+              markAnyharnessSpontaneousTurn();
             }
 
             if (session.cancelled) {
@@ -3937,6 +3930,11 @@ export class ClaudeAcpAgent {
         return await this.anyharnessLoopClear(sessionId, session, params);
       case "anyharness/loop/list":
         return { loops: activeLoops(session.anyharness).map(loopWireFromState) };
+      case "anyharness/activity/list":
+        return {
+          processes: [...session.anyharness.processes.values()].map(processWireFromState),
+          subagents: [...session.anyharness.subagents.values()].map(subagentWireFromState),
+        };
       default:
         throw RequestError.methodNotFound(method);
     }
@@ -4081,29 +4079,76 @@ export class ClaudeAcpAgent {
     const expr = schedule.expr.trim();
     const recurring = params.recurring !== false;
 
-    const created = new Promise<LoopState>((resolve) => {
-      ah.pendingLoopSets.push({
-        prompt,
-        schedule: { kind: schedule.kind, expr },
-        recurring,
-        requestedAtMs: Date.now(),
-        resolve,
-      });
-    });
-    this.pushInjectedInstruction(sessionId, session, `/loop ${expr} ${prompt}`);
+    // Fire attribution is transcript-owned, so loop/set must ensure the tailer
+    // is live even in sessions that never used GoalPort.
+    this.ensureTranscriptTailer(sessionId, session);
 
-    const observed = await Promise.race([created, sleep(LOOP_SET_TIMEOUT_MS).then(() => null)]);
-    if (observed) {
-      return { loop: loopWireFromState(observed) };
+    let settleCreated: (loop: LoopState | null) => void = () => {};
+    const created = new Promise<LoopState | null>((resolve) => {
+      settleCreated = resolve;
+    });
+    const pending: PendingLoopSet = {
+      prompt,
+      schedule: { kind: schedule.kind, expr } as LoopSchedule,
+      recurring,
+      requestedAtMs: Date.now(),
+      resolve: (loop) => settleCreated(loop),
+      fail: () => settleCreated(null),
+    };
+    ah.pendingLoopSets.push(pending);
+
+    if (!this.canInjectLoopNow(session)) {
+      // The current AnyHarness runtime correlates confirmation to the loopId
+      // returned by this call. Mirror and emit the SAME provisional id before
+      // returning; old #25's response-only provisional always timed out in the
+      // current 15-second confirmation path.
+      const loop: LoopState = {
+        loopId: `provisional-${randomUUID().slice(0, 8)}`,
+        prompt,
+        schedule: pending.schedule,
+        recurring,
+        status: "active",
+        lastFiredAtMs: null,
+        fireCount: 0,
+        createdAtMs: pending.requestedAtMs,
+        updatedAtMs: Date.now(),
+      };
+      pending.provisionalLoopId = loop.loopId;
+      pending.resolve = () => {};
+      ah.loops.set(loop.loopId, loop);
+      this.enqueueLoopInstruction(
+        sessionId,
+        session,
+        `/loop ${expr} ${prompt}`,
+        loop.loopId,
+        pending,
+      );
+      await this.sendAnyharnessEvent(sessionId, "loop_upserted", {
+        loop: loopWireFromState(loop),
+        loopId: loop.loopId,
+      });
+      return { loop: loopWireFromState(loop) };
+    }
+
+    this.enqueueLoopInstruction(sessionId, session, `/loop ${expr} ${prompt}`, "", pending);
+
+    const outcome = await Promise.race([
+      created.then((loop) => ({ kind: "settled" as const, loop })),
+      sleep(LOOP_SET_TIMEOUT_MS).then(() => ({ kind: "timeout" as const })),
+    ]);
+    if (outcome.kind === "settled") {
+      if (outcome.loop) {
+        return { loop: loopWireFromState(outcome.loop) };
+      }
+      throw RequestError.internalError(
+        undefined,
+        "native loop command completed without creating a cron job",
+      );
     }
 
     this.logger.error(
       `[anyharness] loop/set: CronCreate not observed within ${LOOP_SET_TIMEOUT_MS}ms; returning provisional loop`,
     );
-    const pendingIndex = ah.pendingLoopSets.findIndex((pending) => pending.prompt === prompt);
-    if (pendingIndex >= 0) {
-      ah.pendingLoopSets.splice(pendingIndex, 1);
-    }
     const loop: LoopState = {
       loopId: `provisional-${randomUUID().slice(0, 8)}`,
       prompt,
@@ -4112,10 +4157,13 @@ export class ClaudeAcpAgent {
       status: "active",
       lastFiredAtMs: null,
       fireCount: 0,
+      createdAtMs: pending.requestedAtMs,
       updatedAtMs: Date.now(),
     };
+    pending.provisionalLoopId = loop.loopId;
+    pending.resolve = () => {};
     ah.loops.set(loop.loopId, loop);
-    void this.sendAnyharnessEvent(sessionId, "loop_updated", {
+    await this.sendAnyharnessEvent(sessionId, "loop_upserted", {
       loop: loopWireFromState(loop),
       loopId: loop.loopId,
     });
@@ -4128,20 +4176,72 @@ export class ClaudeAcpAgent {
     params: Record<string, unknown>,
   ): Promise<{ cleared: number }> {
     const ah = session.anyharness;
-    const loopId = typeof params.loopId === "string" ? params.loopId : undefined;
+    const requestedLoopId = typeof params.loopId === "string" ? params.loopId : undefined;
+    const loopId = requestedLoopId
+      ? (ah.loopAliases.get(requestedLoopId) ?? requestedLoopId)
+      : undefined;
     const targets = activeLoops(ah).filter((loop) => !loopId || loop.loopId === loopId);
     if (targets.length === 0) {
       return { cleared: 0 };
     }
 
+    // Deferred sets can be cancelled cleanly before their /loop command is
+    // pushed. An in-flight set keeps its pending correlation but both its
+    // provisional and eventual native ids stay retired. Apply this to an
+    // explicit id and to clear-all so queued sets cannot re-arm afterward.
+    const targetIds = new Set(targets.map((loop) => loop.loopId));
+    const pendingTargetIds = new Set<string>();
+    for (const pending of [...ah.pendingLoopSets]) {
+      const provisionalId = pending.provisionalLoopId;
+      if (!provisionalId || !targetIds.has(provisionalId)) {
+        continue;
+      }
+      pendingTargetIds.add(provisionalId);
+      pending.clearRequested = true;
+      const provisional = ah.loops.get(provisionalId);
+      if (provisional?.status === "active") {
+        provisional.status = "cleared";
+        provisional.updatedAtMs = Date.now();
+        await this.sendAnyharnessEvent(sessionId, "loop_removed", {
+          loopId: provisionalId,
+        });
+      }
+      const deferredIndex = ah.deferredLoopInjections.findIndex(
+        (injection) => injection.uuid === pending.injectionUuid,
+      );
+      if (deferredIndex >= 0) {
+        const [cancelled] = ah.deferredLoopInjections.splice(deferredIndex, 1);
+        ah.injectedUuids.delete(cancelled.uuid);
+        ah.pendingLoopSets = ah.pendingLoopSets.filter((candidate) => candidate !== pending);
+        pending.fail();
+      }
+    }
+
+    const nativeTargets = targets.filter((loop) => !pendingTargetIds.has(loop.loopId));
+    if (nativeTargets.length === 0) {
+      return { cleared: targets.length };
+    }
+
     const instruction = loopId
       ? `Use the CronDelete tool to delete the cron job with id "${loopId}". Do nothing else and reply with only: done`
       : "Use the CronList tool to list all cron jobs, then use the CronDelete tool to delete each one. Do nothing else and reply with only: done";
-    this.pushInjectedInstruction(sessionId, session, instruction);
+    const injectedNow = this.enqueueLoopInstruction(sessionId, session, instruction, loopId ?? "");
+
+    if (!injectedNow) {
+      for (const loop of nativeTargets) {
+        loop.status = "cleared";
+        loop.updatedAtMs = Date.now();
+        await this.sendAnyharnessEvent(sessionId, "loop_removed", { loopId: loop.loopId });
+      }
+      if (requestedLoopId) {
+        ah.loopAliases.delete(requestedLoopId);
+      }
+      return { cleared: targets.length };
+    }
 
     const confirmed = new Promise<void>((resolve) => {
       const check = () => {
-        if (targets.every((loop) => loop.status === "cleared")) {
+        if (nativeTargets.every((loop) => loop.status === "cleared")) {
           resolve();
         }
       };
@@ -4150,15 +4250,18 @@ export class ClaudeAcpAgent {
     });
     await Promise.race([confirmed, sleep(LOOP_CLEAR_TIMEOUT_MS)]);
 
-    for (const loop of targets) {
+    for (const loop of nativeTargets) {
       if (loop.status !== "cleared") {
         this.logger.error(
           `[anyharness] loop/clear: CronDelete for ${loop.loopId} not observed within ${LOOP_CLEAR_TIMEOUT_MS}ms; marking cleared optimistically`,
         );
         loop.status = "cleared";
         loop.updatedAtMs = Date.now();
-        void this.sendAnyharnessEvent(sessionId, "loop_cleared", { loopId: loop.loopId });
+        void this.sendAnyharnessEvent(sessionId, "loop_removed", { loopId: loop.loopId });
       }
+    }
+    if (requestedLoopId) {
+      ah.loopAliases.delete(requestedLoopId);
     }
     return { cleared: targets.length };
   }
@@ -4169,6 +4272,7 @@ export class ClaudeAcpAgent {
     toolName: string,
     toolInput: unknown,
     toolResponse: unknown,
+    origin: { promptId?: string; agentId?: string } = {},
   ): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) {
@@ -4183,15 +4287,29 @@ export class ClaudeAcpAgent {
       const input = (toolInput ?? {}) as { cron?: unknown; prompt?: unknown; recurring?: unknown };
       const promptText = typeof input.prompt === "string" ? input.prompt : "";
       const loopId =
+        parseCronIdFromResult(toolResponse) ??
         extractCronId(toolResponse) ??
         extractCronId(toolInput) ??
         `cron-${randomUUID().slice(0, 8)}`;
 
-      let pendingIndex = ah.pendingLoopSets.findIndex((pending) => pending.prompt === promptText);
-      if (pendingIndex < 0 && ah.pendingLoopSets.length > 0) {
-        pendingIndex = 0;
-      }
+      // CronCreate belongs to a LoopPort request only when it is observed
+      // inside that request's exact injected turn. Prompt matching can steal a
+      // deferred same-prompt request from an unrelated native CronCreate.
+      // prompt_id is a distinct prompt-grain UUID, not SDKUserMessage.uuid.
+      // Main-thread turns execute sequentially, so the active injection UUID
+      // is authoritative once agent_id has excluded concurrent child hooks.
+      const correlatedInjectionUuid = !origin.agentId ? ah.loopInjectionUuid : null;
+      const pendingIndex = correlatedInjectionUuid
+        ? ah.pendingLoopSets.findIndex(
+            (pending) => pending.injectionUuid === correlatedInjectionUuid,
+          )
+        : -1;
       const pending = pendingIndex >= 0 ? ah.pendingLoopSets.splice(pendingIndex, 1)[0] : undefined;
+      const pendingPlaceholder = pending?.provisionalLoopId
+        ? ah.loops.get(pending.provisionalLoopId)
+        : undefined;
+      const placeholders = pendingPlaceholder ? [pendingPlaceholder] : [];
+      const clearedBeforeCreate = pending?.clearRequested === true;
       const loop: LoopState = {
         loopId,
         prompt: promptText || pending?.prompt || "",
@@ -4202,25 +4320,54 @@ export class ClaudeAcpAgent {
             : { kind: "cron", expr: "" }),
         recurring:
           typeof input.recurring === "boolean" ? input.recurring : (pending?.recurring ?? true),
-        status: "active",
-        lastFiredAtMs: null,
-        fireCount: 0,
+        // A clear that raced an in-flight set already emitted loop_removed for
+        // the provisional id. Keep the reconciled native id retired even when
+        // its best-effort CronDelete command later fails.
+        status: clearedBeforeCreate ? "cleared" : "active",
+        lastFiredAtMs: placeholders[0]?.lastFiredAtMs ?? null,
+        fireCount: placeholders[0]?.fireCount ?? 0,
+        createdAtMs: placeholders[0]?.createdAtMs ?? pending?.requestedAtMs ?? Date.now(),
         updatedAtMs: Date.now(),
       };
+      for (const placeholder of placeholders) {
+        ah.loops.delete(placeholder.loopId);
+        ah.loopAliases.set(placeholder.loopId, loopId);
+      }
       ah.loops.set(loopId, loop);
       pending?.resolve(loop);
-      await this.sendAnyharnessEvent(sessionId, "loop_updated", {
-        loop: loopWireFromState(loop),
-        loopId,
-      });
+      if (!clearedBeforeCreate) {
+        await this.sendAnyharnessEvent(sessionId, "loop_upserted", {
+          loop: loopWireFromState(loop),
+          loopId,
+        });
+      }
+      for (const placeholder of placeholders) {
+        if (placeholder.status === "active") {
+          await this.sendAnyharnessEvent(sessionId, "loop_removed", {
+            loopId: placeholder.loopId,
+          });
+        }
+      }
+      if (clearedBeforeCreate) {
+        this.enqueueLoopInstruction(
+          sessionId,
+          session,
+          `Use the CronDelete tool to delete the cron job with id "${loopId}". Do nothing else and reply with only: done`,
+          loopId,
+        );
+      }
       return;
     }
 
     if (toolName === "CronDelete") {
-      const deletedId = extractCronId(toolInput) ?? extractCronId(toolResponse);
+      const requestedId =
+        extractCronId(toolInput) ??
+        parseCronIdFromResult(toolResponse) ??
+        extractCronId(toolResponse);
+      const deletedId = requestedId ? (ah.loopAliases.get(requestedId) ?? requestedId) : undefined;
       const active = activeLoops(ah);
       let target = deletedId ? ah.loops.get(deletedId) : undefined;
-      if (!target && active.length === 1) {
+      if (!deletedId && !target && active.length === 1) {
         target = active[0];
       }
       if (!target) {
@@ -4232,12 +4379,407 @@ export class ClaudeAcpAgent {
       if (target.status !== "cleared") {
         target.status = "cleared";
         target.updatedAtMs = Date.now();
-        await this.sendAnyharnessEvent(sessionId, "loop_cleared", { loopId: target.loopId });
+        await this.sendAnyharnessEvent(sessionId, "loop_removed", { loopId: target.loopId });
+      }
+      for (const [alias, realId] of ah.loopAliases) {
+        if (realId === target.loopId || alias === target.loopId) {
+          ah.loopAliases.delete(alias);
+        }
       }
       for (const watcher of ah.loopClearWatchers) {
         watcher();
       }
     }
+  }
+
+  private subagentFeedPathFor(session: Session, sessionId: string, taskId: string): string {
+    const parentTranscript =
+      session.anyharness.transcriptPath ??
+      this.pendingTranscriptPaths.get(sessionId) ??
+      computeTranscriptPath(CLAUDE_CONFIG_DIR, session.cwd, sessionId);
+    return subagentFeedPath(parentTranscript, sessionId, taskId);
+  }
+
+  /** Keep only the small reorder window needed to correlate Bash tool IO with
+   * task_started. Foreground Bash calls never become tasks, so an unbounded map
+   * would leak for the lifetime of the persistent consumer. */
+  private rememberActivityTaskToolUse(
+    session: Session,
+    toolUseId: string,
+    patch: { command?: string; outputFile?: string },
+  ): void {
+    const cache = session.anyharness.taskToolUse;
+    const existing = cache.get(toolUseId) ?? {};
+    cache.delete(toolUseId);
+    cache.set(toolUseId, { ...existing, ...patch });
+    while (cache.size > MAX_ACTIVITY_TASK_TOOL_USES) {
+      const oldest = cache.keys().next().value;
+      if (typeof oldest !== "string") {
+        break;
+      }
+      cache.delete(oldest);
+    }
+  }
+
+  /** Capture the spawning Bash command and real background-output path from
+   * ordinary assistant/user content without disturbing PR #28's transcript
+   * demultiplexing. */
+  private captureActivityTaskIo(sessionId: string, message: SDKMessage): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const content = (message as { message?: { content?: unknown } }).message?.content;
+    if (!Array.isArray(content)) {
+      return;
+    }
+    for (const block of content) {
+      if (typeof block !== "object" || block === null) {
+        continue;
+      }
+      const value = block as {
+        type?: string;
+        id?: string;
+        name?: string;
+        input?: { command?: unknown };
+        tool_use_id?: string;
+        content?: unknown;
+      };
+      if (
+        value.type === "tool_use" &&
+        value.name === "Bash" &&
+        typeof value.id === "string" &&
+        typeof value.input?.command === "string"
+      ) {
+        this.rememberActivityTaskToolUse(session, value.id, { command: value.input.command });
+        continue;
+      }
+      if (value.type !== "tool_result" || typeof value.tool_use_id !== "string") {
+        continue;
+      }
+      const outputFile = parseBackgroundOutputFile(value.content);
+      if (!outputFile) {
+        continue;
+      }
+      this.rememberActivityTaskToolUse(session, value.tool_use_id, { outputFile });
+      const process = [...session.anyharness.processes.values()].find(
+        (candidate) => candidate.toolUseId === value.tool_use_id,
+      );
+      if (process && process.feed?.path !== outputFile) {
+        process.feed = { kind: "tail_file", path: outputFile };
+        session.anyharness.taskToolUse.delete(value.tool_use_id);
+        void this.sendAnyharnessEvent(sessionId, "process_upserted", {
+          process: processWireFromState(process),
+        });
+      }
+    }
+  }
+
+  /** Normalize current Claude task lifecycle messages onto ActivityPort's
+   * process/subagent rosters. This runs alongside (never instead of) the
+   * persistent consumer's task-hold and bounded child-lane cleanup. */
+  private handleActivityTaskEvent(
+    sessionId: string,
+    message: SDKMessage,
+    liveBackgroundTaskIds?: ReadonlySet<string>,
+  ): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const ah = session.anyharness;
+    const now = Date.now();
+    const event = message as unknown as {
+      subtype: "task_started" | "task_progress" | "task_notification" | "task_updated";
+      task_id?: string;
+      tool_use_id?: string;
+      task_type?: string;
+      subagent_type?: string;
+      agent_type?: string;
+      model?: string;
+      description?: string;
+      summary?: string;
+      status?: string;
+      is_backgrounded?: boolean;
+      background?: boolean;
+      output_file?: string;
+      usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number };
+      patch?: {
+        status?: string;
+        is_backgrounded?: boolean;
+        description?: string;
+        summary?: string;
+      };
+    };
+    const taskId = event.task_id;
+    if (!taskId) {
+      return;
+    }
+    const status = event.patch?.status ?? event.status;
+    const background = event.patch?.is_backgrounded ?? event.is_backgrounded ?? event.background;
+    const description = event.patch?.description ?? event.description;
+    const summary = event.patch?.summary ?? event.summary;
+    const outputFile =
+      typeof event.output_file === "string" && event.output_file.length > 0
+        ? event.output_file
+        : undefined;
+    const usage = event.usage
+      ? {
+          tokensUsed:
+            typeof event.usage.total_tokens === "number" ? event.usage.total_tokens : null,
+          toolCalls: typeof event.usage.tool_uses === "number" ? event.usage.tool_uses : null,
+          durationSeconds:
+            typeof event.usage.duration_ms === "number" ? event.usage.duration_ms / 1000 : null,
+        }
+      : null;
+
+    if (event.subtype === "task_started") {
+      const captured = event.tool_use_id ? ah.taskToolUse.get(event.tool_use_id) : undefined;
+      const cachedTool = event.tool_use_id ? session.toolUseCache[event.tool_use_id] : undefined;
+      const isSubagent =
+        typeof event.subagent_type === "string" || event.task_type === "local_agent";
+      if (isSubagent) {
+        const subagent: SubagentState = {
+          id: taskId,
+          agentType: event.subagent_type ?? event.agent_type ?? null,
+          description: event.description ?? event.patch?.description ?? null,
+          model: event.model ?? null,
+          background: background ?? liveBackgroundTaskIds?.has(taskId) ?? false,
+          status: "running",
+          summary: null,
+          tokensUsed: null,
+          toolCalls: null,
+          durationSeconds: null,
+          feed: {
+            kind: "tail_file",
+            path: this.subagentFeedPathFor(session, sessionId, taskId),
+          },
+        };
+        ah.subagents.set(taskId, subagent);
+        if (event.tool_use_id) {
+          ah.taskToolUse.delete(event.tool_use_id);
+        }
+        void this.sendAnyharnessEvent(sessionId, "subagent_upserted", {
+          subagent: subagentWireFromState(subagent),
+        });
+        return;
+      }
+
+      const isBackgroundBash =
+        event.task_type === "local_bash" || captured !== undefined || cachedTool?.name === "Bash";
+      if (!isBackgroundBash) {
+        return;
+      }
+      const cachedInput = cachedTool?.input as { command?: unknown } | undefined;
+      const process: ProcessState = {
+        id: taskId,
+        command:
+          captured?.command ??
+          (typeof cachedInput?.command === "string" ? cachedInput.command : undefined) ??
+          event.description ??
+          "",
+        cwd: session.cwd ?? null,
+        status: "running",
+        exitCode: null,
+        pid: null,
+        startedAtMs: now,
+        endedAtMs: null,
+        feed: captured?.outputFile ? { kind: "tail_file", path: captured.outputFile } : null,
+        toolUseId: event.tool_use_id ?? null,
+      };
+      ah.processes.set(taskId, process);
+      if (event.tool_use_id) {
+        ah.taskToolUse.delete(event.tool_use_id);
+      }
+      void this.sendAnyharnessEvent(sessionId, "process_upserted", {
+        process: processWireFromState(process),
+      });
+      return;
+    }
+
+    const subagent = ah.subagents.get(taskId);
+    if (subagent) {
+      if (typeof background === "boolean") {
+        subagent.background = background;
+      }
+      if (typeof description === "string") {
+        subagent.description = description;
+      }
+      if (summary) {
+        subagent.summary = summary;
+      }
+      if (usage) {
+        Object.assign(subagent, usage);
+      }
+      // task_notification.output_file is the task result artifact, not the
+      // native child JSONL. Keep ActivityPort's live-tail feed on the stable
+      // derived transcript lane established at task_started.
+      if (status === "pending" || status === "running" || status === "paused") {
+        subagent.status = "running";
+      } else if (status === "completed") {
+        subagent.status = "completed";
+      } else if (status === "failed" || status === "stopped" || status === "killed") {
+        subagent.status = "failed";
+      }
+      void this.sendAnyharnessEvent(sessionId, "subagent_upserted", {
+        subagent: subagentWireFromState(subagent),
+      });
+      if (subagent.status !== "running" && event.tool_use_id) {
+        ah.taskToolUse.delete(event.tool_use_id);
+      }
+      return;
+    }
+
+    const process = ah.processes.get(taskId);
+    if (!process) {
+      return;
+    }
+    if (outputFile) {
+      process.feed = { kind: "tail_file", path: outputFile };
+    }
+    if (
+      event.subtype === "task_notification" ||
+      status === "completed" ||
+      status === "failed" ||
+      status === "stopped" ||
+      status === "killed"
+    ) {
+      process.status = "exited";
+      process.endedAtMs ??= now;
+    }
+    void this.sendAnyharnessEvent(sessionId, "process_upserted", {
+      process: processWireFromState(process),
+    });
+    if (process.status === "exited" && process.toolUseId) {
+      ah.taskToolUse.delete(process.toolUseId);
+    }
+  }
+
+  /** A background-level snapshot can promote a known subagent's background
+   * flag, but absence is not terminal: synchronous subagents are absent by
+   * design and remain live for permission attribution. */
+  private reconcileActivityBackgroundFlags(
+    sessionId: string,
+    tasks: Array<{ task_id: string }>,
+  ): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    for (const task of tasks) {
+      const subagent = session.anyharness.subagents.get(task.task_id);
+      if (subagent && !subagent.background) {
+        subagent.background = true;
+        void this.sendAnyharnessEvent(sessionId, "subagent_upserted", {
+          subagent: subagentWireFromState(subagent),
+        });
+      }
+    }
+  }
+
+  /** A native loop command is safe only at a true persistent-consumer idle
+   * boundary with no ACP turn (including a background-subagent-held turn) and
+   * no earlier injected loop command still processing. */
+  private canInjectLoopNow(session: Session): boolean {
+    const hasQueuedTurn = (session.turnQueue ?? []).some((turn) => !turn.settled);
+    const consumerIdle = !session.consumer || session.lastSessionState === "idle";
+    return (
+      !session.queryClosed &&
+      !session.anyharness.loopInjectionInFlight &&
+      session.anyharness.injectedUuids.size === 0 &&
+      !session.activeTurn &&
+      !hasQueuedTurn &&
+      consumerIdle
+    );
+  }
+
+  /** Push immediately when safe; otherwise retain the native command until
+   * the next idle. The queue is drained one command per idle boundary. */
+  private enqueueLoopInstruction(
+    sessionId: string,
+    session: Session,
+    text: string,
+    loopId: string,
+    pending?: PendingLoopSet,
+  ): boolean {
+    const uuid = randomUUID();
+    if (pending) {
+      pending.injectionUuid = uuid;
+    }
+    if (!this.canInjectLoopNow(session)) {
+      session.anyharness.deferredLoopInjections.push({ uuid, text, loopId });
+      return false;
+    }
+    const message: SDKUserMessage = {
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text }] },
+      session_id: sessionId,
+      parent_tool_use_id: null,
+      uuid,
+    };
+    session.anyharness.injectedUuids.add(uuid);
+    session.anyharness.loopInjectionInFlight = true;
+    session.anyharness.loopInjectionUuid = uuid;
+    session.input.push(message);
+    this.ensureConsumer(session, sessionId);
+    return true;
+  }
+
+  private tryFlushDeferredLoopInjection(sessionId: string, session: Session): void {
+    if (!this.canInjectLoopNow(session)) {
+      return;
+    }
+    const injection = session.anyharness.deferredLoopInjections.shift();
+    if (!injection) {
+      return;
+    }
+    const message: SDKUserMessage = {
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text: injection.text }] },
+      session_id: sessionId,
+      parent_tool_use_id: null,
+      uuid: injection.uuid as SDKUserMessage["uuid"],
+    };
+    session.anyharness.injectedUuids.add(injection.uuid);
+    session.anyharness.loopInjectionInFlight = true;
+    session.anyharness.loopInjectionUuid = injection.uuid;
+    session.input.push(message);
+    this.ensureConsumer(session, sessionId);
+  }
+
+  /** Complete exactly one loop command. A missing CronCreate means the native
+   * command failed, so retire its pending/provisional mirror instead of letting
+   * a later same-prompt command reconcile against stale state. */
+  private finishLoopInjection(sessionId: string, session: Session, uuid: string): void {
+    const ah = session.anyharness;
+    if (ah.loopInjectionUuid !== uuid) {
+      return;
+    }
+    ah.loopInjectionInFlight = false;
+    ah.loopInjectionUuid = null;
+    ah.injectedUuids.delete(uuid);
+
+    const pendingIndex = ah.pendingLoopSets.findIndex(
+      (candidate) => candidate.injectionUuid === uuid,
+    );
+    if (pendingIndex < 0) {
+      return;
+    }
+    const [pending] = ah.pendingLoopSets.splice(pendingIndex, 1);
+    pending.fail();
+    const provisional = pending.provisionalLoopId
+      ? ah.loops.get(pending.provisionalLoopId)
+      : undefined;
+    if (provisional?.status === "active") {
+      provisional.status = "cleared";
+      provisional.updatedAtMs = Date.now();
+      void this.sendAnyharnessEvent(sessionId, "loop_removed", {
+        loopId: provisional.loopId,
+      });
+    }
+    this.logger.error(
+      `[anyharness] loop command ${uuid} completed without an observed CronCreate; retired pending loop`,
+    );
   }
 
   /** Queue a native slash/instruction turn on the persistent v0.59 consumer. */
@@ -4259,7 +4801,13 @@ export class ClaudeAcpAgent {
   private async sendAnyharnessEvent(
     sessionId: string,
     transcriptEvent: AnyharnessTranscriptEvent,
-    payload: { goal?: GoalWire; loop?: LoopWire; loopId?: string },
+    payload: {
+      goal?: GoalWire;
+      loop?: LoopWire;
+      loopId?: string;
+      process?: ProcessWire;
+      subagent?: SubagentWire;
+    },
   ): Promise<void> {
     try {
       await this.client.sessionUpdate({
@@ -4340,7 +4888,54 @@ export class ClaudeAcpAgent {
     tailer.start();
   }
 
+  private recordLoopFireFromTranscript(sessionId: string, prompt: string, firedAtMs: number): void {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      return;
+    }
+    const provisionalIds = new Set(
+      session.anyharness.pendingLoopSets
+        .map((pending) => pending.provisionalLoopId)
+        .filter((loopId): loopId is string => typeof loopId === "string"),
+    );
+    const loop = matchLoopForWake(
+      activeLoops(session.anyharness).filter(
+        (candidate) => !provisionalIds.has(candidate.loopId) && firedAtMs >= candidate.createdAtMs,
+      ),
+      prompt,
+    );
+    if (!loop) {
+      return;
+    }
+    const now = Date.now();
+    loop.fireCount += 1;
+    loop.lastFiredAtMs = firedAtMs;
+    loop.updatedAtMs = now;
+    void this.sendAnyharnessEvent(sessionId, "loop_fired", {
+      loop: loopWireFromState(loop),
+      loopId: loop.loopId,
+    });
+    if (!loop.recurring) {
+      loop.status = "cleared";
+      loop.updatedAtMs = Date.now();
+      void this.sendAnyharnessEvent(sessionId, "loop_removed", {
+        loopId: loop.loopId,
+      });
+      for (const [alias, realId] of session.anyharness.loopAliases) {
+        if (realId === loop.loopId || alias === loop.loopId) {
+          session.anyharness.loopAliases.delete(alias);
+        }
+      }
+    }
+  }
+
   private handleTranscriptRow(sessionId: string, row: unknown): void {
+    const cronFirePrompt = extractCronFirePrompt(row);
+    if (cronFirePrompt) {
+      const timestamp = (row as { timestamp: string }).timestamp;
+      this.recordLoopFireFromTranscript(sessionId, cronFirePrompt, Date.parse(timestamp));
+      return;
+    }
     const goalStatus = extractGoalStatus(row);
     if (!goalStatus) {
       return;
@@ -5913,8 +6508,8 @@ export class ClaudeAcpAgent {
                 },
                 onTranscriptPath: (transcriptPath) =>
                   this.noteTranscriptPath(sessionId, transcriptPath),
-                onCronTool: (toolName, toolInput, toolResponse) =>
-                  this.handleCronTool(sessionId, toolName, toolInput, toolResponse),
+                onCronTool: (toolName, toolInput, toolResponse, origin) =>
+                  this.handleCronTool(sessionId, toolName, toolInput, toolResponse, origin),
               }),
             ],
           },
