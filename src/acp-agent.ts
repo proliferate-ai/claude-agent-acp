@@ -1799,17 +1799,29 @@ export class ClaudeAcpAgent {
     // just the tail if the stream was cut short. Content-prefix matching (rather
     // than id equality) deliberately preserves v0.59's gateway compatibility.
     // Each lane is replaced on its next message_start and deleted after its
-    // consolidated assistant message or parent-task settlement. Real-turn
-    // activation also sweeps child lanes whose task registry bookend was lost,
-    // bounding interrupted streams without clearing the root lane that may have
-    // started before its echo.
+    // consolidated assistant message or parent-task settlement. A result/later
+    // background-level handshake and the existing real-turn activation sweep
+    // bound lanes whose task registry bookend was lost, without clearing the
+    // root lane that may have started before its echo.
     const streamedAssistantLanes = new Map<
       string,
       {
         messageId?: string;
         blocks: { index: number; type: "text" | "thinking"; text: string }[];
+        /** Result-boundary generation at which this child lane became
+         * quiescent. Later background-task levels may retire it if its task
+         * stays absent; any intervening stream activity clears the arm. */
+        retireAfterLevel?: number;
+        /** First post-result generation that omitted the owning task. A second
+         * consecutive absent level retires it; an inclusive level resets this
+         * grace so a racing pre-registration payload cannot delete a live lane. */
+        absentAfterLevel?: number;
       }
     >();
+    // Monotonic generation of authoritative background-task level signals.
+    // Paired with a prior result boundary, it bounds lost-bookend child lanes
+    // without guessing that a currently-active foreground child is dead.
+    let backgroundLevelGeneration = 0;
     /** Drop a settled task's attribution and any interrupted transcript lane
      * together. A terminal task event is the boundary after which the SDK can
      * no longer emit child content, so retaining its partial text would leak one
@@ -2941,22 +2953,21 @@ export class ClaudeAcpAgent {
               // control requests, which this adapter never issues.
               case "control_request_progress":
                 break;
-              case "background_tasks_changed":
+              case "background_tasks_changed": {
                 // A level signal: the full live background-task set on every
-                // membership change, with REPLACE semantics. Used only to
-                // reconcile `liveBackgroundTasks` — dropping (or, for
-                // subagent entries, unpinning) any entry whose settle
-                // bookend (task_notification / terminal task_updated) was
-                // lost, so a leaked subagent entry can't defer its spawning
-                // turn's settlement forever. Growth of retained
-                // (endedPerLevel) subagent entries is bounded by the
-                // activation-time sweep in activateTurn, not here. It never
-                // ADDS entries (the payload carries no attribution or
-                // subagent marker), so the unspecified ordering vs. the edge
-                // bookends is safe: a level that precedes its task_started
-                // simply no-ops here.
+                // membership change, with REPLACE semantics. It reconciles the
+                // task registry and, after a result plus two consecutive absent
+                // generations, safely retires child stream lanes whose terminal
+                // bookends were lost. A live background task must appear in a
+                // corrective level; a live sync/foreground child cannot cross
+                // the prior terminal result; and any post-result stream activity
+                // disarms its lane. The extra absent-generation grace mirrors
+                // endedPerLevel: a payload built before task registration can
+                // race after the result without irreversibly deleting a lane
+                // before the corrective inclusive level arrives.
+                backgroundLevelGeneration++;
+                const live = new Set(message.tasks.map((t) => t.task_id));
                 if (session.liveBackgroundTasks.size > 0) {
-                  const live = new Set(message.tasks.map((t) => t.task_id));
                   for (const [taskId, record] of session.liveBackgroundTasks) {
                     if (live.has(taskId)) {
                       // The level proves the task live in the background
@@ -2982,13 +2993,57 @@ export class ClaudeAcpAgent {
                     }
                   }
                 }
+
+                // Resolve lane parent ids through the task registry rather than
+                // guessing. Missing mappings stay untouched: retaining an
+                // unclassified lane is safer than truncating a live transcript.
+                const taskIdByParent = new Map<string, string>();
+                for (const [taskId, record] of session.liveBackgroundTasks) {
+                  if (record.parentToolUseId) {
+                    taskIdByParent.set(record.parentToolUseId, taskId);
+                  }
+                }
+                for (const [parentKey, lane] of streamedAssistantLanes) {
+                  if (
+                    !parentKey ||
+                    lane.retireAfterLevel === undefined ||
+                    lane.retireAfterLevel >= backgroundLevelGeneration
+                  ) {
+                    continue;
+                  }
+                  const taskId = taskIdByParent.get(parentKey);
+                  if (!taskId) {
+                    continue;
+                  }
+                  if (live.has(taskId)) {
+                    lane.absentAfterLevel = undefined;
+                    continue;
+                  }
+                  if (lane.absentAfterLevel === undefined) {
+                    lane.absentAfterLevel = backgroundLevelGeneration;
+                    continue;
+                  }
+                  forgetLiveBackgroundTask(taskId, parentKey);
+                }
                 break;
+              }
               default:
                 unreachable(message, this.logger);
                 break;
             }
             break;
           case "result": {
+            // A result is the terminal boundary for this processing cycle. Arm
+            // every child lane that has gone quiet; do not delete yet, because
+            // a background task can legitimately outlive the cycle. A later
+            // REPLACE-semantics background level confirms which armed tasks are
+            // absent. Stream activity after this point disarms its lane.
+            for (const [parentKey, lane] of streamedAssistantLanes) {
+              if (parentKey) {
+                lane.retireAfterLevel = backgroundLevelGeneration;
+                lane.absentAfterLevel = undefined;
+              }
+            }
             // A result from an autonomous cycle — a task-notification
             // followup, or a peer/coordinator/observer message the model
             // handled on its own (see AUTONOMOUS_RESULT_ORIGINS) — is not
@@ -3320,6 +3375,12 @@ export class ClaudeAcpAgent {
               });
             }
             let streamLane = streamedAssistantLanes.get(streamParentKey);
+            if (streamParentKey && streamLane && message.event.type !== "message_start") {
+              // This child is active after the last result boundary. A later
+              // level must not retire its prefix until another result arms it.
+              streamLane.retireAfterLevel = undefined;
+              streamLane.absentAfterLevel = undefined;
+            }
             // Accumulate the text/thinking actually streamed live, so the
             // `assistant` case below can diff its assembled blocks against what
             // already reached the client on THIS parent lane and forward only
@@ -4993,9 +5054,9 @@ export class ClaudeAcpAgent {
                 supportsTerminalOutput,
                 session?.cwd,
               ),
-              // Tool-call metadata carries the native name in both the generic
-              // and Claude-specific namespaces.
-              ...(parentToolUseId ? { _meta: nativeToolMetadata(toolName, parentToolUseId) } : {}),
+              // Permission payloads need native identity even for root tools;
+              // child calls additionally carry their parent association.
+              _meta: nativeToolMetadata(toolName, parentToolUseId),
             },
           },
           toolName,
@@ -5070,9 +5131,9 @@ export class ClaudeAcpAgent {
               supportsTerminalOutput,
               session?.cwd,
             ),
-            // Tool-call metadata carries the native name in both the generic
-            // and Claude-specific namespaces.
-            ...(parentToolUseId ? { _meta: nativeToolMetadata(toolName, parentToolUseId) } : {}),
+            // Permission payloads need native identity even for root tools;
+            // child calls additionally carry their parent association.
+            _meta: nativeToolMetadata(toolName, parentToolUseId),
           },
         },
         toolName,

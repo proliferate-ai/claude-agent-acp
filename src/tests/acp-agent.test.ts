@@ -2451,6 +2451,47 @@ describe("subagent permission attribution (issue #851)", () => {
     return { agent, updates, requests, log, session: agent.sessions["session-1"]! };
   }
 
+  it.each(["Agent", "Task"] as const)(
+    "includes native subagent metadata on a root %s permission request",
+    async (toolName) => {
+      const { agent, requests } = setup();
+
+      await agent.canUseTool("session-1")(toolName, { prompt: "investigate" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: `toolu_root_${toolName.toLowerCase()}`,
+      } as any);
+
+      expect(requests[0].toolCall._meta).toMatchObject({
+        anyharness: { nativeToolName: toolName, toolKind: "subagent" },
+        claudeCode: { toolName },
+      });
+      expect((requests[0].toolCall._meta as any).anyharness.parentToolCallId).toBeUndefined();
+      expect((requests[0].toolCall._meta as any).claudeCode.parentToolUseId).toBeUndefined();
+    },
+  );
+
+  it.each(["Bash", "ExitPlanMode"] as const)(
+    "includes native tool metadata on a root %s permission request",
+    async (toolName) => {
+      const { agent, requests } = setup();
+
+      await agent.canUseTool("session-1")(toolName, {}, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: `toolu_root_${toolName.toLowerCase()}`,
+      } as any);
+
+      expect(requests[0].toolCall._meta).toMatchObject({
+        anyharness: { nativeToolName: toolName },
+        claudeCode: { toolName },
+      });
+      expect((requests[0].toolCall._meta as any).anyharness.toolKind).toBeUndefined();
+      expect((requests[0].toolCall._meta as any).anyharness.parentToolCallId).toBeUndefined();
+      expect((requests[0].toolCall._meta as any).claudeCode.parentToolUseId).toBeUndefined();
+    },
+  );
+
   it("attributes a subagent tool's eager tool_call and permission request to the spawning tool call", async () => {
     const { agent, updates, requests, session } = setup();
     session.liveBackgroundTasks.set("agent-42", {
@@ -2481,7 +2522,7 @@ describe("subagent permission attribution (issue #851)", () => {
     });
   });
 
-  it("omits the attribution (and logs the miss) when the agent id has no recorded parent", async () => {
+  it("keeps native identity but omits parent attribution when the agent id is unknown", async () => {
     const { agent, updates, requests, log } = setup();
 
     await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
@@ -2491,9 +2532,18 @@ describe("subagent permission attribution (issue #851)", () => {
       agentID: "agent-unknown",
     } as any);
 
-    const meta = updates[0].update._meta as { claudeCode?: { parentToolUseId?: string } };
-    expect(meta.claudeCode?.parentToolUseId).toBeUndefined();
-    expect(requests[0].toolCall._meta).toBeUndefined();
+    const updateMeta = updates[0].update._meta as {
+      anyharness?: { parentToolCallId?: string };
+      claudeCode?: { parentToolUseId?: string };
+    };
+    expect(updateMeta.anyharness?.parentToolCallId).toBeUndefined();
+    expect(updateMeta.claudeCode?.parentToolUseId).toBeUndefined();
+    expect(requests[0].toolCall._meta).toMatchObject({
+      anyharness: { nativeToolName: "Bash" },
+      claudeCode: { toolName: "Bash" },
+    });
+    expect((requests[0].toolCall._meta as any).anyharness.parentToolCallId).toBeUndefined();
+    expect((requests[0].toolCall._meta as any).claudeCode.parentToolUseId).toBeUndefined();
     // The task_id === agentID invariant is undocumented SDK behavior; a miss
     // must be observable so an SDK bump that breaks it doesn't regress silently.
     expect(log).toHaveBeenCalledWith(expect.stringContaining("agent-unknown"));
@@ -5710,6 +5760,125 @@ describe("assembled assistant text fallback", () => {
         },
       });
     }
+  });
+
+  it("bounds lost-bookend child lanes across autonomous cycles without a new prompt", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const orphanParents = ["toolu_orphan_1", "toolu_orphan_2", "toolu_orphan_3"];
+    const taskStarted = (taskId: string, parentToolUseId: string) => ({
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      tool_use_id: parentToolUseId,
+      description: "Explore",
+      subagent_type: "Explore",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const backgroundLevel = (taskIds: string[]) => ({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: taskIds.map((task_id) => ({
+        task_id,
+        task_type: "local_agent",
+        description: "Explore",
+      })),
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const autonomousResult = () => ({
+      ...result(),
+      origin: { kind: "task-notification" },
+    });
+
+    // Settle the one ACP prompt first. Everything after this point is driven by
+    // the persistent consumer; the generator never requests another input.
+    const messages: any[] = [result(), idle];
+    orphanParents.forEach((parentToolUseId, index) => {
+      const taskId = `agent-orphan-${index + 1}`;
+      messages.push(
+        taskStarted(taskId, parentToolUseId),
+        backgroundLevel([taskId]),
+        messageStart(`msg-orphan-${index + 1}`, parentToolUseId),
+        textDelta(`orphan ${index + 1}`, parentToolUseId),
+        // The consolidated assistant and terminal task frames are lost. The
+        // cycle result arms the lane; the first later empty level starts its
+        // grace, and the next level that still omits it retires the lane without
+        // a new foreground activation.
+        autonomousResult(),
+        backgroundLevel([]),
+        idle,
+      );
+    });
+
+    const liveTaskId = "agent-live";
+    const liveParent = "toolu_live";
+    messages.push(
+      taskStarted(liveTaskId, liveParent),
+      backgroundLevel([liveTaskId]),
+      messageStart("msg-live", liveParent),
+      textDelta("live prefix ", liveParent),
+      autonomousResult(),
+      // A racing payload built before registration can omit a still-live task
+      // even after the result. The first absence is only a candidate; the
+      // corrective inclusive level must reset it and preserve prefix dedupe.
+      backgroundLevel([]),
+      backgroundLevel([liveTaskId]),
+      assistantMessage("msg-live", [{ type: "text", text: "live prefix tail" }], liveParent),
+      {
+        type: "system",
+        subtype: "task_notification",
+        task_id: liveTaskId,
+        tool_use_id: liveParent,
+        status: "completed",
+        output_file: "",
+        summary: "done",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      backgroundLevel([]),
+      idle,
+    );
+
+    const deleteSpy = vi.spyOn(Map.prototype, "delete");
+    try {
+      injectSession(agent, messages);
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      await agent.sessions["test-session"]?.consumer;
+
+      const retiredParents = deleteSpy.mock.calls
+        .map(([key]) => key)
+        .filter((key): key is string =>
+          typeof key === "string" ? key.startsWith("toolu_orphan_") : false,
+        );
+      expect(new Set(retiredParents)).toEqual(new Set(orphanParents));
+      expect(agent.sessions["test-session"]!.liveBackgroundTasks.size).toBe(0);
+    } finally {
+      deleteSpy.mockRestore();
+    }
+
+    const chunks = updates.filter(
+      (update) => update.update?.sessionUpdate === "agent_message_chunk",
+    );
+    expect(chunks.map((update) => update.update.content.text)).toEqual([
+      "orphan 1",
+      "orphan 2",
+      "orphan 3",
+      "live prefix ",
+      "tail",
+    ]);
+    expect(chunks.map((update) => update.update.messageId)).toEqual([
+      "msg-orphan-1",
+      "msg-orphan-2",
+      "msg-orphan-3",
+      "msg-live",
+      "msg-live",
+    ]);
+    expect(chunks.map((update) => update.update._meta?.anyharness?.parentToolCallId)).toEqual([
+      ...orphanParents,
+      liveParent,
+      liveParent,
+    ]);
   });
 
   it("keeps child tool progress nested with provider-neutral native metadata", async () => {
