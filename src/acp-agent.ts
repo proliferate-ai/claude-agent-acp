@@ -736,9 +736,20 @@ type ProviderConfig = {
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
+  /** Provider-neutral metadata consumed by AnyHarness. Additive to the
+   *  Claude-specific fields below so existing ACP clients remain compatible. */
+  anyharness?: {
+    /** Native provider tool name (for example `Agent`, `Task`, or `Bash`). */
+    nativeToolName?: string;
+    /** Semantic tool category. Native Agent/Task calls are subagents. */
+    toolKind?: "subagent";
+    /** Native Agent/Task tool call that owns this child transcript event. */
+    parentToolCallId?: string;
+  };
   claudeCode?: {
-    /* The name of the tool that was used in Claude Code. */
-    toolName: string;
+    /* The name of the tool that was used in Claude Code. Child message/thought
+       chunks carry only parentToolUseId, so it is absent on those updates. */
+    toolName?: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
     /* For a tool call made inside a subagent: the tool_use id of the
@@ -1775,22 +1786,42 @@ export class ClaudeAcpAgent {
     // compaction, and the two messages are indistinguishable — so we report the
     // outcome only while a compaction is in progress, then clear this.
     let compactionInProgress = false;
-    // Anthropic API message id of the assistant message currently being
-    // streamed, captured from `message_start` so the streamed chunks that follow
-    // (whose delta events don't carry it) can all be tagged with the same,
-    // replay-stable id.
-    let currentStreamMessageId: string | undefined;
-    // The text/thinking blocks that have actually streamed live as
-    // `stream_event` deltas for the message the next consolidated `assistant`
-    // will repeat, in stream order, each accumulated to its full streamed text.
-    // The consolidated handler diffs each assembled block against these and
-    // forwards only the un-streamed remainder — nothing if it streamed in full
-    // (the common case), the whole block if it never streamed (a non-streaming
-    // gateway), or just the tail if the stream was cut short mid-block. Matching
-    // on content rather than the Anthropic message id makes dedupe robust to
-    // gateways that don't carry a stable/matching id across the stream and the
-    // consolidated message. Reset after each consolidated message consumes it.
-    const streamedBlocks: { index: number; type: "text" | "thinking"; text: string }[] = [];
+    // Streaming state is isolated per native parent tool call: the root agent
+    // uses the empty-string lane, while each child uses its parent_tool_use_id.
+    // A single consumer-global id lets an interleaved child message_start steal
+    // the identity of later root chunks (and vice versa), so each lane owns both
+    // its Anthropic API message id and its streamed-content reconciliation.
+    //
+    // The blocks are the text/thinking deltas that actually reached the client,
+    // accumulated in document order. The consolidated handler diffs its blocks
+    // against the matching lane and forwards only the un-streamed remainder —
+    // nothing if it streamed in full, the whole block if it never streamed, or
+    // just the tail if the stream was cut short. Content-prefix matching (rather
+    // than id equality) deliberately preserves v0.59's gateway compatibility.
+    // Each lane is replaced on its next message_start and deleted after its
+    // consolidated assistant message or parent-task settlement. Real-turn
+    // activation also sweeps child lanes whose task registry bookend was lost,
+    // bounding interrupted streams without clearing the root lane that may have
+    // started before its echo.
+    const streamedAssistantLanes = new Map<
+      string,
+      {
+        messageId?: string;
+        blocks: { index: number; type: "text" | "thinking"; text: string }[];
+      }
+    >();
+    /** Drop a settled task's attribution and any interrupted transcript lane
+     * together. A terminal task event is the boundary after which the SDK can
+     * no longer emit child content, so retaining its partial text would leak one
+     * buffer per cancelled/lost child in a persistent autonomous session. */
+    const forgetLiveBackgroundTask = (taskId: string, parentToolUseId?: string): void => {
+      const task = session.liveBackgroundTasks.get(taskId);
+      const parentKey = parentToolUseId || task?.parentToolUseId;
+      if (parentKey) {
+        streamedAssistantLanes.delete(parentKey);
+      }
+      session.liveBackgroundTasks.delete(taskId);
+    };
     // Tool-use blocks start streaming before their JSON input. Keep the
     // partial input per parent message and block index so completed top-level
     // fields can refine the pending tool call while it streams. Entries are
@@ -1853,6 +1884,10 @@ export class ClaudeAcpAgent {
      *  as the turn's answer. */
     const sendUpdate = async (notification: SessionNotification) => {
       const { update } = notification;
+      // Converge every persistent-consumer emission on provider-neutral native
+      // tool/parent metadata, including direct progress/permission-denial paths
+      // that do not pass through toAcpNotifications.
+      applyAnyharnessTranscriptMetadata(update);
       if (update.sessionUpdate === "agent_message_chunk") {
         const claudeMeta = update._meta?.claudeCode as
           { parentToolUseId?: string | null } | undefined;
@@ -1870,13 +1905,14 @@ export class ClaudeAcpAgent {
       lastAssistantError = undefined;
       lastRefusalExplanation = null;
       compactionInProgress = false;
-      // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
+      // Do NOT reset streamedAssistantLanes here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
       // streamed-content record on activation would drop the blocks that
       // streamed before the echo, so the consolidated assistant message would
-      // re-emit them as duplicates. streamedBlocks is bounded instead by being
-      // cleared when each consolidated message consumes it. #785 stopped
+      // re-emit them as duplicates. Each lane is bounded instead by being
+      // replaced at message_start and deleted when its consolidated message is
+      // consumed. #785 stopped
       // resetting the streamed-content tracking here but left this line.
       stopReason = "end_turn";
       session.accumulatedUsage = {
@@ -1921,6 +1957,21 @@ export class ClaudeAcpAgent {
             session.liveBackgroundTasks.delete(taskId);
           } else {
             record.endedPerLevel = "sweep-armed";
+          }
+        }
+        // A cancelled/lost child stream may never deliver its consolidated
+        // assistant message, so its parent lane would otherwise remain for the
+        // life of this persistent consumer. Sweep lanes whose owning task is no
+        // longer registered. Keep the root lane unconditionally: a new turn's
+        // root deltas can precede the replayed user echo that activates it.
+        const liveParentToolUseIds = new Set(
+          [...session.liveBackgroundTasks.values()]
+            .map((record) => record.parentToolUseId)
+            .filter((id): id is string => !!id),
+        );
+        for (const parentKey of streamedAssistantLanes.keys()) {
+          if (parentKey && !liveParentToolUseIds.has(parentKey)) {
+            streamedAssistantLanes.delete(parentKey);
           }
         }
       }
@@ -2693,6 +2744,9 @@ export class ClaudeAcpAgent {
                 // rejection reason — otherwise the client shows a tool call
                 // that silently never resolves.
                 const reason = message.decision_reason ?? message.message;
+                const parentToolUseId = message.agent_id
+                  ? session.liveBackgroundTasks.get(message.agent_id)?.parentToolUseId
+                  : undefined;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -2708,6 +2762,7 @@ export class ClaudeAcpAgent {
                     _meta: {
                       claudeCode: {
                         toolName: message.tool_name,
+                        ...(parentToolUseId ? { parentToolUseId } : {}),
                         toolResponse: {
                           decisionReasonType: message.decision_reason_type,
                           decisionReason: message.decision_reason,
@@ -2777,8 +2832,9 @@ export class ClaudeAcpAgent {
                 break;
               case "task_notification":
                 // The task settled — no further tool calls can originate
-                // from it, so its registry entry can be dropped.
-                session.liveBackgroundTasks.delete(message.task_id);
+                // from it, so its registry entry and interrupted transcript
+                // lane can be dropped together.
+                forgetLiveBackgroundTask(message.task_id, message.tool_use_id);
                 break;
               case "task_updated":
                 // terminal-status task_updated patch and a (deduplicated)
@@ -2791,7 +2847,7 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
-                  session.liveBackgroundTasks.delete(message.task_id);
+                  forgetLiveBackgroundTask(message.task_id);
                 }
                 break;
               case "worker_shutting_down":
@@ -3251,37 +3307,25 @@ export class ClaudeAcpAgent {
           }
           case "stream_event": {
             await markAnyharnessSpontaneousTurn();
+            const streamParentKey = message.parent_tool_use_id ?? "";
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow (whose delta events don't carry
-            // it) can all be tagged with the same, replay-stable id.
+            // it) can all be tagged with the same, replay-stable id. Replace only
+            // this parent lane: root and child streams may interleave, and a new
+            // message on one lane must not disturb another lane's partial state.
             if (message.event.type === "message_start") {
-              currentStreamMessageId = message.event.message.id || undefined;
-              // A new top-level message starts: clear any streamed-content
-              // residue from a prior message that never reached its
-              // consolidated reset — a cancelled turn breaks out before the
-              // reset, and the synthetic-auth/system/local-command paths
-              // `break` early too. Block indices restart at 0 each message, so
-              // leftover entries would otherwise collide with this message's
-              // blocks and re-emit (or truncate) already-streamed text. Gated on
-              // `parent_tool_use_id === null` so a subagent stream can't clear
-              // the top-level record. Fires once, before any of this message's
-              // blocks, so it doesn't disturb the mid-message turn-activation
-              // path the way resetting on turn activation would.
-              if (message.parent_tool_use_id === null) {
-                streamedBlocks.length = 0;
-              }
+              streamedAssistantLanes.set(streamParentKey, {
+                messageId: message.event.message.id || undefined,
+                blocks: [],
+              });
             }
+            let streamLane = streamedAssistantLanes.get(streamParentKey);
             // Accumulate the text/thinking actually streamed live, so the
             // `assistant` case below can diff its assembled blocks against what
-            // already reached the client as chunks and forward only the
-            // remainder. Gated on `parent_tool_use_id === null` so a subagent
-            // stream can't attribute its content to the top-level message.
-            // Contiguous deltas of the same block (same index and type) extend
-            // the current entry; anything else opens a new one.
-            if (
-              message.parent_tool_use_id === null &&
-              message.event.type === "content_block_delta"
-            ) {
+            // already reached the client on THIS parent lane and forward only
+            // the remainder. Contiguous deltas of the same block (same index and
+            // type) extend the current entry; anything else opens a new one.
+            if (message.event.type === "content_block_delta") {
               const delta = message.event.delta;
               const chunk =
                 delta.type === "text_delta"
@@ -3295,12 +3339,18 @@ export class ClaudeAcpAgent {
               // guard can never consume, stalling the diff cursor and
               // re-emitting the next block as a duplicate.
               if (chunk?.text) {
+                if (!streamLane) {
+                  // Tolerate gateways that omit message_start. The chunks still
+                  // reconcile by content; only their messageId remains unknown.
+                  streamLane = { blocks: [] };
+                  streamedAssistantLanes.set(streamParentKey, streamLane);
+                }
                 const index = message.event.index;
-                const last = streamedBlocks[streamedBlocks.length - 1];
+                const last = streamLane.blocks[streamLane.blocks.length - 1];
                 if (last && last.index === index && last.type === chunk.type) {
                   last.text += chunk.text;
                 } else {
-                  streamedBlocks.push({ index, type: chunk.type, text: chunk.text });
+                  streamLane.blocks.push({ index, type: chunk.type, text: chunk.text });
                 }
               }
             }
@@ -3365,7 +3415,7 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
-                messageId: currentStreamMessageId,
+                messageId: streamLane?.messageId,
                 streamedToolInputs,
               },
             )) {
@@ -3549,17 +3599,17 @@ export class ClaudeAcpAgent {
             }
 
             let content: typeof message.message.content;
-            if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              // Top-level assistant message: each text/thinking block may have
-              // already been streamed live as deltas. Diff each against what
-              // streamed (`streamedBlocks`, in document order) and forward only
-              // the un-streamed remainder — nothing if it streamed in full (the
+            if (message.type === "assistant") {
+              // Root and child assistant messages share the same reconciliation
+              // rule, scoped to their native parent lane. Each text/thinking
+              // block may already have streamed live as deltas; forward only the
+              // un-streamed remainder — nothing if it streamed in full (the
               // common case), the whole block if it never streamed (a
               // non-streaming gateway), or just the tail if the stream was cut
-              // short mid-block. `streamPos` walks the streamed blocks in step
-              // with the assembled text/thinking blocks; tool_use and other
-              // blocks pass through untouched (their own `toolUseCache` collapses
-              // the streamed/assembled pair) without advancing it.
+              // short mid-block. Child output remains contained by the parent
+              // metadata stamped below rather than being discarded.
+              const streamParentKey = message.parent_tool_use_id ?? "";
+              const streamedBlocks = streamedAssistantLanes.get(streamParentKey)?.blocks ?? [];
               const blocks = message.message.content;
               const kept: typeof blocks = [];
               let streamPos = 0;
@@ -3607,17 +3657,9 @@ export class ClaudeAcpAgent {
                 kept.push(item);
               }
               content = kept;
-              // Consumed: reset so the next message's blocks accumulate fresh and
-              // the record stays bounded to the in-flight message.
-              streamedBlocks.length = 0;
-            } else if (message.type === "assistant") {
-              // Subagent assistant message (`parent_tool_use_id !== null`). It is
-              // never streamed live and its text/thinking is internal to the tool
-              // call — keep dropping it so subagent prose doesn't leak into the
-              // top-level feed.
-              content = message.message.content.filter(
-                (item) => item.type !== "text" && item.type !== "thinking",
-              );
+              // Consumed: delete only this parent lane so an interleaved root or
+              // sibling child retains its own id and prefix/tail record.
+              streamedAssistantLanes.delete(streamParentKey);
             } else {
               content = message.message.content;
             }
@@ -3639,10 +3681,9 @@ export class ClaudeAcpAgent {
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
               },
             )) {
-              // sendUpdate records delivery. Subagent text/thinking is
-              // filtered out of `content` above; blocks that do pass through
-              // (e.g. a subagent image) carry the stamped parentToolUseId
-              // meta and are excluded there.
+              // sendUpdate records delivery. Child chunks carry the stamped
+              // parentToolUseId meta and remain excluded from the top-level
+              // answer-delivery flag.
               await sendUpdate(notification);
             }
             break;
@@ -3658,6 +3699,9 @@ export class ClaudeAcpAgent {
                   claudeCode: {
                     toolName: message.tool_name,
                     toolResponse: { elapsedTimeSeconds: message.elapsed_time_seconds },
+                    ...(message.parent_tool_use_id
+                      ? { parentToolUseId: message.parent_tool_use_id }
+                      : {}),
                   },
                 } satisfies ToolUpdateMeta,
               },
@@ -4768,6 +4812,7 @@ export class ClaudeAcpAgent {
           clientCapabilities: this.clientCapabilities,
           cwd: this.sessions[sessionId]?.cwd,
           taskState: this.sessions[sessionId]?.taskState,
+          parentToolUseId: message.parent_tool_use_id,
           messageId: replayMessageId,
         },
       )) {
@@ -4856,15 +4901,7 @@ export class ClaudeAcpAgent {
       supportsTerminalOutput,
       session.cwd,
     );
-    if (parentToolUseId) {
-      update._meta = {
-        ...update._meta,
-        claudeCode: {
-          ...(update._meta?.claudeCode || {}),
-          parentToolUseId,
-        },
-      };
-    }
+    applyAnyharnessTranscriptMetadata(update, parentToolUseId);
     await this.client.sessionUpdate({ sessionId, update });
   }
 
@@ -4956,11 +4993,9 @@ export class ClaudeAcpAgent {
                 supportsTerminalOutput,
                 session?.cwd,
               ),
-              // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
-              // so clients can rely on one shape everywhere.
-              ...(parentToolUseId
-                ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-                : {}),
+              // Tool-call metadata carries the native name in both the generic
+              // and Claude-specific namespaces.
+              ...(parentToolUseId ? { _meta: nativeToolMetadata(toolName, parentToolUseId) } : {}),
             },
           },
           toolName,
@@ -5035,11 +5070,9 @@ export class ClaudeAcpAgent {
               supportsTerminalOutput,
               session?.cwd,
             ),
-            // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
-            // so clients can rely on one shape everywhere.
-            ...(parentToolUseId
-              ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-              : {}),
+            // Tool-call metadata carries the native name in both the generic
+            // and Claude-specific namespaces.
+            ...(parentToolUseId ? { _meta: nativeToolMetadata(toolName, parentToolUseId) } : {}),
           },
         },
         toolName,
@@ -7097,6 +7130,73 @@ function applyMessageId(
   }
 }
 
+/** Add provider-neutral AnyHarness fields to Claude-native metadata while
+ * retaining the legacy keys for compatibility. */
+function anyharnessTranscriptMetadata(
+  meta: ToolUpdateMeta | undefined,
+  parentToolUseId?: string | null,
+): ToolUpdateMeta | undefined {
+  const nativeToolName = meta?.claudeCode?.toolName;
+  const parentToolCallId = parentToolUseId || meta?.claudeCode?.parentToolUseId;
+  if (!nativeToolName && !parentToolCallId) {
+    return meta;
+  }
+
+  return {
+    ...meta,
+    anyharness: {
+      ...(meta?.anyharness ?? {}),
+      ...(nativeToolName ? { nativeToolName } : {}),
+      ...(nativeToolName === "Agent" || nativeToolName === "Task"
+        ? { toolKind: "subagent" as const }
+        : {}),
+      ...(parentToolCallId ? { parentToolCallId } : {}),
+    },
+    ...(parentToolCallId
+      ? {
+          claudeCode: {
+            ...(meta?.claudeCode ?? {}),
+            parentToolUseId: parentToolCallId,
+          },
+        }
+      : {}),
+  };
+}
+
+/** Mirror Claude-native tool and parent identity onto one ACP update. This is
+ * intentionally usable on message/thought chunks (parent but no tool name) as
+ * well as tool calls/updates (native name and optional parent). Reapplying it is
+ * idempotent, which lets the persistent consumer use it as a send chokepoint
+ * while replay/converter paths call it directly. */
+function applyAnyharnessTranscriptMetadata(
+  update: SessionNotification["update"],
+  parentToolUseId?: string | null,
+): void {
+  const meta = update._meta as ToolUpdateMeta | undefined;
+  const enriched = anyharnessTranscriptMetadata(meta, parentToolUseId);
+  if (enriched !== meta) {
+    update._meta = enriched;
+  }
+}
+
+/** Build the common metadata shape for a native tool event. */
+function nativeToolMetadata(
+  toolName: string,
+  parentToolUseId?: string | null,
+  toolResponse?: unknown,
+): ToolUpdateMeta {
+  return anyharnessTranscriptMetadata(
+    {
+      claudeCode: {
+        toolName,
+        ...(toolResponse !== undefined ? { toolResponse } : {}),
+        ...(parentToolUseId ? { parentToolUseId } : {}),
+      },
+    },
+    parentToolUseId,
+  )!;
+}
+
 /** Built-in tools that drive the task list (headless/SDK sessions use these
  *  instead of TodoWrite). Their tool_use/tool_result are surfaced as `plan`
  *  snapshots rather than as tool_calls. */
@@ -7135,7 +7235,7 @@ function toolCallNotification(
 ): SessionNotification["update"] {
   if (refine) {
     return {
-      _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+      _meta: nativeToolMetadata(toolUse.name),
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput,
@@ -7144,7 +7244,7 @@ function toolCallNotification(
   }
   return {
     _meta: {
-      claudeCode: { toolName: toolUse.name },
+      ...nativeToolMetadata(toolUse.name),
       ...(toolUse.name === "Bash" && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
@@ -7179,7 +7279,7 @@ function streamedInputRefinement(
     cwd,
   );
   return {
-    _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+    _meta: nativeToolMetadata(toolUse.name),
     toolCallId: toolUse.id,
     sessionUpdate: "tool_call_update",
     rawInput: input,
@@ -7241,16 +7341,7 @@ export function toAcpNotifications(
       },
     };
     applyMessageId(update, options?.messageId);
-
-    if (options?.parentToolUseId) {
-      update._meta = {
-        ...update._meta,
-        claudeCode: {
-          ...(update._meta?.claudeCode || {}),
-          parentToolUseId: options.parentToolUseId,
-        },
-      };
-    }
+    applyAnyharnessTranscriptMetadata(update, options?.parentToolUseId);
 
     return [{ sessionId, update }];
   }
@@ -7351,12 +7442,7 @@ export function toAcpNotifications(
                     ? toolUpdateFromDiffToolResponse(toolResponse)
                     : {};
                 const update: SessionNotification["update"] = {
-                  _meta: {
-                    claudeCode: {
-                      toolResponse,
-                      toolName,
-                    },
-                  } satisfies ToolUpdateMeta,
+                  _meta: nativeToolMetadata(toolName, options?.parentToolUseId, toolResponse),
                   toolCallId: toolUseId,
                   sessionUpdate: "tool_call_update",
                   ...editDiff,
@@ -7425,17 +7511,21 @@ export function toAcpNotifications(
           // stay pending in the client forever; without the cache entry the
           // tool name is unknown, so no claudeCode meta is attached.
           if (wasEmitted) {
+            const unresolvedUpdate: SessionNotification["update"] = {
+              toolCallId: chunk.tool_use_id,
+              sessionUpdate: "tool_call_update" as const,
+              status:
+                "is_error" in chunk && chunk.is_error
+                  ? ("failed" as const)
+                  : ("completed" as const),
+              rawOutput: chunk.content,
+            };
+            // The tool name is unavailable, but the containing message still
+            // provides the child-parent association.
+            applyAnyharnessTranscriptMetadata(unresolvedUpdate, options?.parentToolUseId);
             output.push({
               sessionId,
-              update: {
-                toolCallId: chunk.tool_use_id,
-                sessionUpdate: "tool_call_update" as const,
-                status:
-                  "is_error" in chunk && chunk.is_error
-                    ? ("failed" as const)
-                    : ("completed" as const),
-                rawOutput: chunk.content,
-              },
+              update: unresolvedUpdate,
             });
           }
           logger.error(
@@ -7453,23 +7543,17 @@ export function toAcpNotifications(
         // these tools via the permission flow: the streamed plan/suppressed
         // branches don't record emissions.
         if (wasEmitted && !shouldEmitToolCall(toolUse.name)) {
+          const surfacedPlanUpdate: SessionNotification["update"] = {
+            _meta: nativeToolMetadata(toolUse.name, options?.parentToolUseId),
+            toolCallId: chunk.tool_use_id,
+            sessionUpdate: "tool_call_update" as const,
+            status:
+              "is_error" in chunk && chunk.is_error ? ("failed" as const) : ("completed" as const),
+            rawOutput: chunk.content,
+          };
           output.push({
             sessionId,
-            update: {
-              _meta: {
-                claudeCode: {
-                  toolName: toolUse.name,
-                  ...(options?.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
-                },
-              } satisfies ToolUpdateMeta,
-              toolCallId: chunk.tool_use_id,
-              sessionUpdate: "tool_call_update" as const,
-              status:
-                "is_error" in chunk && chunk.is_error
-                  ? ("failed" as const)
-                  : ("completed" as const),
-              rawOutput: chunk.content,
-            },
+            update: surfacedPlanUpdate,
           });
         }
 
@@ -7511,18 +7595,17 @@ export function toAcpNotifications(
           //   2. tool_call_update → _meta.terminal_output (sent here)
           //   3. tool_call_update → _meta.terminal_exit  (sent below with status)
           if (toolMeta?.terminal_output) {
+            const terminalOutputUpdate: SessionNotification["update"] = {
+              _meta: {
+                ...nativeToolMetadata(toolUse.name, options?.parentToolUseId),
+                terminal_output: toolMeta.terminal_output,
+              },
+              toolCallId: chunk.tool_use_id,
+              sessionUpdate: "tool_call_update" as const,
+            };
             output.push({
               sessionId,
-              update: {
-                _meta: {
-                  terminal_output: toolMeta.terminal_output,
-                  ...(options?.parentToolUseId
-                    ? { claudeCode: { parentToolUseId: options.parentToolUseId } }
-                    : {}),
-                },
-                toolCallId: chunk.tool_use_id,
-                sessionUpdate: "tool_call_update" as const,
-              },
+              update: terminalOutputUpdate,
             });
           }
 
@@ -7567,15 +7650,7 @@ export function toAcpNotifications(
         break;
     }
     if (update) {
-      if (options?.parentToolUseId) {
-        update._meta = {
-          ...update._meta,
-          claudeCode: {
-            ...(update._meta?.claudeCode || {}),
-            parentToolUseId: options.parentToolUseId,
-          },
-        };
-      }
+      applyAnyharnessTranscriptMetadata(update, options?.parentToolUseId);
       applyMessageId(update, options?.messageId);
       output.push({ sessionId, update });
     }
@@ -7679,15 +7754,7 @@ export function streamEventToAcpNotifications(
           options?.cwd,
         );
         if (!update) return [];
-        if (message.parent_tool_use_id) {
-          update._meta = {
-            ...update._meta,
-            claudeCode: {
-              ...(update._meta?.claudeCode || {}),
-              parentToolUseId: message.parent_tool_use_id,
-            },
-          };
-        }
+        applyAnyharnessTranscriptMetadata(update, message.parent_tool_use_id);
         applyMessageId(update, options?.messageId);
         return [{ sessionId, update }];
       }

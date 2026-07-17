@@ -822,13 +822,15 @@ describe("Bash terminal output", () => {
       // Split into 2 notifications: terminal_output, then terminal_exit + completion
       expect(notifications).toHaveLength(2);
 
-      // First notification: terminal_output only
+      // First notification: terminal_output plus additive native tool identity
       const outputUpdate = notifications[0].update;
       expect(outputUpdate).toMatchObject({
         sessionUpdate: "tool_call_update",
         toolCallId: "toolu_bash",
       });
       expect((outputUpdate as any)._meta).toEqual({
+        anyharness: { nativeToolName: "Bash" },
+        claudeCode: { toolName: "Bash" },
         terminal_output: { terminal_id: "toolu_bash", data: "file1.txt\nfile2.txt" },
       });
       expect((outputUpdate as any).status).toBeUndefined();
@@ -954,10 +956,12 @@ describe("Bash terminal output", () => {
 
       expect(notifications).toHaveLength(2);
 
-      // First notification (terminal_output) has no claudeCode
+      // First notification carries terminal_output plus native identity in both
+      // the provider-neutral and legacy namespaces.
       const outputMeta = (notifications[0].update as any)._meta;
       expect(outputMeta.terminal_output).toBeDefined();
-      expect(outputMeta.claudeCode).toBeUndefined();
+      expect(outputMeta.anyharness).toEqual({ nativeToolName: "Bash" });
+      expect(outputMeta.claudeCode).toEqual({ toolName: "Bash" });
 
       // Second notification (completion) has claudeCode + terminal_exit
       const exitMeta = (notifications[1].update as any)._meta;
@@ -1426,8 +1430,10 @@ describe("Bash terminal output", () => {
       // Should produce 2 notifications: terminal_output, then terminal_exit + completion
       expect(resultNotifications).toHaveLength(2);
 
-      // First: terminal_output only
+      // First: terminal_output plus additive native tool identity
       expect((resultNotifications[0].update as any)._meta).toEqual({
+        anyharness: { nativeToolName: "Bash" },
+        claudeCode: { toolName: "Bash" },
         terminal_output: { terminal_id: "toolu_bash_hook", data: "file1.txt" },
       });
 
@@ -1454,14 +1460,15 @@ describe("Bash terminal output", () => {
         { signal: AbortSignal.abort() },
       );
 
-      // Step 4: Hook update should only have claudeCode, no terminal fields
-      // (terminal events were already sent as separate notifications)
+      // Step 4: Hook update keeps native identity but no terminal fields
+      // (terminal events were already sent as separate notifications).
       expect(hookUpdates).toHaveLength(1);
       const hookMeta = hookUpdates[0].update._meta;
       expect(hookMeta.claudeCode).toMatchObject({
         toolName: "Bash",
         toolResponse: "file1.txt",
       });
+      expect(hookMeta.anyharness).toEqual({ nativeToolName: "Bash" });
       expect(hookMeta.terminal_info).toBeUndefined();
       expect(hookMeta.terminal_output).toBeUndefined();
       expect(hookMeta.terminal_exit).toBeUndefined();
