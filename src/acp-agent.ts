@@ -97,6 +97,15 @@ import {
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
+import {
+  anyharnessCapabilities,
+  fileCheckpointingFromMeta,
+  forkAnchorFromMeta,
+  parseRewindFilesRequest,
+  REWIND_FILES_METHOD,
+  RewindFilesRequest,
+  RewindFilesResponse,
+} from "./anyharness-fork.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -1628,6 +1637,12 @@ export class ClaudeAcpAgent {
           controlMethod: GOAL_CONTROL_METHOD,
           actions: [...GOAL_ACTIONS],
         } satisfies GoalCapability,
+        // AnyHarness delta: the inclusive fork anchor (carried on `session/fork`
+        // via `_meta.anyharness.upToMessageId`) and the labeled provider-partial
+        // `_anyharness/rewindFiles` fast path. Absence of this block means a
+        // client is talking to canonical, unpatched claude-agent-acp — the
+        // runtime must never infer these from harness name or protocol version.
+        anyharness: anyharnessCapabilities(),
       },
     };
   }
@@ -1645,6 +1660,32 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    // AnyHarness delta: an optional INCLUSIVE anchor rides in
+    // `_meta.anyharness.upToMessageId`. Absent → an unanchored tip fork
+    // (canonical behavior). Present → resolve the ACP message id to the SDK
+    // uuid the `resumeSessionAt` option keys on. A requested-but-unresolvable
+    // anchor is a HARD error, never a silent tip fork (ADR §5 cardinal sin):
+    // the source session must be resident and must know the id.
+    const anchorMessageId = forkAnchorFromMeta(params._meta);
+    let resumeSessionAt: string | undefined;
+    if (anchorMessageId !== undefined) {
+      const sourceSession = this.sessions[params.sessionId];
+      if (!sourceSession) {
+        throw RequestError.invalidParams(
+          { sessionId: params.sessionId },
+          "cannot resolve an anchored fork: the source session is not resident; load it before forking at a message",
+        );
+      }
+      const uuid = sourceSession.messageIdToUuid.get(anchorMessageId);
+      if (uuid === undefined) {
+        throw RequestError.invalidParams(
+          { sessionId: params.sessionId, upToMessageId: anchorMessageId },
+          "cannot resolve an anchored fork: `_meta.anyharness.upToMessageId` does not name a known message in the source session",
+        );
+      }
+      resumeSessionAt = uuid;
+    }
+
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -1655,6 +1696,7 @@ export class ClaudeAcpAgent {
       {
         resume: params.sessionId,
         forkSession: true,
+        ...(resumeSessionAt !== undefined && { resumeSessionAt }),
       },
     );
     // Needs to happen after we return the session
@@ -1662,6 +1704,40 @@ export class ClaudeAcpAgent {
       this.sendAvailableCommandsUpdate(response.sessionId);
     }, 0);
     return response;
+  }
+
+  /** AnyHarness delta: labeled, provider-PARTIAL file rewind. Restores only
+   *  Write/Edit/NotebookEdit-tracked file changes to the state at the anchored
+   *  user message — never Bash/manual/external changes — and only when the
+   *  session opted into checkpointing at creation. Leaves the conversation
+   *  intact. This is NOT the ADR's complete restore (that is the runtime-owned
+   *  checkpoint layer); it is the optional fast path that layer may offer.
+   *  Resolving the anchor is fail-closed: an unknown id is a hard error, never
+   *  a silent no-op that a caller could mistake for a successful rewind. */
+  async rewindFiles(params: RewindFilesRequest): Promise<RewindFilesResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw RequestError.invalidParams(
+        { sessionId: params.sessionId },
+        "cannot rewind files: session is not resident",
+      );
+    }
+    const uuid = session.messageIdToUuid.get(params.upToMessageId);
+    if (uuid === undefined) {
+      throw RequestError.invalidParams(
+        { sessionId: params.sessionId, upToMessageId: params.upToMessageId },
+        "cannot rewind files: `upToMessageId` does not name a known message in the session",
+      );
+    }
+    const result = await session.query.rewindFiles(uuid, { dryRun: params.dryRun ?? false });
+    return {
+      canRewind: result.canRewind,
+      ...(result.error !== undefined && { error: result.error }),
+      ...(result.filesChanged !== undefined && { filesChanged: result.filesChanged }),
+      ...(result.insertions !== undefined && { insertions: result.insertions }),
+      ...(result.deletions !== undefined && { deletions: result.deletions }),
+      ...(result.skippedLinks !== undefined && { skippedLinks: result.skippedLinks }),
+    };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -5610,7 +5686,7 @@ export class ClaudeAcpAgent {
 
   private async createSession(
     params: NewSessionRequest,
-    creationOpts: { resume?: string; forkSession?: boolean } = {},
+    creationOpts: { resume?: string; forkSession?: boolean; resumeSessionAt?: string } = {},
   ): Promise<NewSessionResponse> {
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
@@ -5883,6 +5959,14 @@ export class ClaudeAcpAgent {
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
       options.sessionId = sessionId;
+    }
+
+    // AnyHarness delta: opt-in SDK file checkpointing so the labeled
+    // `_anyharness/rewindFiles` provider-partial fast path can function. Off by
+    // default — a client that never opts in pays no disk/perf cost and gets a
+    // truthful `canRewind:false` from rewind rather than a silent no-op.
+    if (fileCheckpointingFromMeta(params._meta)) {
+      options.enableFileCheckpointing = true;
     }
 
     // Handle abort controller from meta options
@@ -8031,6 +8115,11 @@ export function runAcp() {
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
+    )
+    .onRequest<RewindFilesRequest, RewindFilesResponse>(
+      REWIND_FILES_METHOD,
+      { parse: parseRewindFilesRequest },
+      (ctx) => agent.rewindFiles(ctx.params),
     )
     .connect(stream);
 
