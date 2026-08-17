@@ -211,7 +211,7 @@ describe("fork session capability advertisement (initialize)", () => {
       clientCapabilities: {},
     });
 
-    const forkMeta = result.agentCapabilities.sessionCapabilities?.fork?._meta;
+    const forkMeta = result.agentCapabilities?.sessionCapabilities?.fork?._meta;
     expect(hasAnyharnessTargetedForkExtension(forkMeta)).toBe(true);
     expect((forkMeta as any).anyharness.targetedFork.target).toBe("message_id");
   });
