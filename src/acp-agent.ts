@@ -926,9 +926,26 @@ type ProviderConfig = {
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
+  /** Provider-neutral transcript metadata consumed by AnyHarness. Additive to
+   *  the Claude-specific `claudeCode` fields below so existing ACP clients stay
+   *  compatible. The AnyHarness runtime reads `parentToolCallId` here as the
+   *  authoritative primary signal for nesting native-subagent transcript events
+   *  (see anyharness-lib's `metadata.rs`); the `claudeCode.parentToolUseId`
+   *  fallback exists only for updates that predate this namespace, so mirroring
+   *  it here keeps the primary path from ceding to the (mis-nesting-prone)
+   *  fallback. */
+  anyharness?: {
+    /** Native provider tool name (for example `Agent`, `Task`, or `Bash`). */
+    nativeToolName?: string;
+    /** Semantic tool category. Native Agent/Task calls are subagent launches. */
+    toolKind?: "subagent";
+    /** Native Agent/Task tool call that owns this child transcript event. */
+    parentToolCallId?: string;
+  };
   claudeCode?: {
-    /* The name of the tool that was used in Claude Code. */
-    toolName: string;
+    /* The name of the tool that was used in Claude Code. Child message/thought
+       chunks carry only `parentToolUseId`, so it is absent on those updates. */
+    toolName?: string;
     /* A human-readable title supplied by Claude Code for the tool call. */
     title?: string;
     /* The structured output provided by Claude Code. */
@@ -2703,6 +2720,11 @@ export class ClaudeAcpAgent {
      *  as the turn's answer. */
     const sendUpdate = async (notification: SessionNotification) => {
       const { update } = notification;
+      // Converge every persistent-consumer emission on the provider-neutral
+      // native tool/parent metadata the runtime reads as its primary nesting
+      // signal, including the direct progress/permission paths that never pass
+      // through toAcpNotifications. Idempotent, so double-stamping is harmless.
+      applyAnyharnessTranscriptMetadata(update);
       if (update.sessionUpdate === "agent_message_chunk") {
         const claudeMeta = update._meta?.claudeCode as
           { parentToolUseId?: string | null } | undefined;
@@ -5357,6 +5379,10 @@ export class ClaudeAcpAgent {
           parentToolUseId,
         },
       )) {
+        // Replay bypasses the live-loop `sendUpdate` chokepoint, so mirror the
+        // native tool/parent identity onto the provider-neutral namespace here
+        // too, keeping loaded/resumed transcripts nestable on the primary path.
+        applyAnyharnessTranscriptMetadata(notification.update);
         await this.client.sessionUpdate(notification);
       }
     }
@@ -5442,15 +5468,11 @@ export class ClaudeAcpAgent {
       supportsTerminalOutput,
       session.cwd,
     );
-    if (parentToolUseId) {
-      update._meta = {
-        ...update._meta,
-        claudeCode: {
-          ...(update._meta?.claudeCode || {}),
-          parentToolUseId,
-        },
-      };
-    }
+    // This permission-surfaced tool_call bypasses `sendUpdate`, so stamp the
+    // provider-neutral metadata here too. When `parentToolUseId` is present it
+    // is mirrored onto both namespaces; when absent, the native tool name is
+    // still surfaced under `anyharness`.
+    applyAnyharnessTranscriptMetadata(update, parentToolUseId);
     await this.client.sessionUpdate({ sessionId, update });
   }
 
@@ -7844,6 +7866,61 @@ function applyMessageId(
       update.sessionUpdate === "agent_thought_chunk")
   ) {
     update.messageId = messageId;
+  }
+}
+
+/** Derive the provider-neutral AnyHarness transcript metadata from the
+ *  Claude-native metadata already stamped on an update, without dropping the
+ *  legacy keys. Returns the SAME `meta` reference when there is nothing to
+ *  mirror (no native tool name and no parent id), so callers can cheaply detect
+ *  a no-op. When a parent id is present it is also written back onto
+ *  `claudeCode.parentToolUseId`, so the two namespaces never disagree about the
+ *  owning tool call. Idempotent: re-running it over already-enriched metadata
+ *  reproduces the same shape. */
+export function anyharnessTranscriptMetadata(
+  meta: ToolUpdateMeta | undefined,
+  parentToolUseId?: string | null,
+): ToolUpdateMeta | undefined {
+  const nativeToolName = meta?.claudeCode?.toolName;
+  const parentToolCallId = parentToolUseId || meta?.claudeCode?.parentToolUseId;
+  const isSubagent =
+    meta?.claudeCode?.subagent === true || nativeToolName === "Agent" || nativeToolName === "Task";
+  if (!nativeToolName && !parentToolCallId) {
+    return meta;
+  }
+  return {
+    ...meta,
+    anyharness: {
+      ...(meta?.anyharness ?? {}),
+      ...(nativeToolName ? { nativeToolName } : {}),
+      ...(isSubagent ? { toolKind: "subagent" as const } : {}),
+      ...(parentToolCallId ? { parentToolCallId } : {}),
+    },
+    ...(parentToolCallId
+      ? {
+          claudeCode: {
+            ...(meta?.claudeCode ?? {}),
+            parentToolUseId: parentToolCallId,
+          },
+        }
+      : {}),
+  };
+}
+
+/** Mirror Claude-native tool/parent identity onto one ACP update's `_meta` in
+ *  place. Safe on message/thought chunks (parent but no tool name) as well as
+ *  tool calls/updates (native name and optional parent). Used as the persistent
+ *  consumer's send chokepoint so every emission — including the direct
+ *  permission/progress paths that bypass `toAcpNotifications` — converges on the
+ *  provider-neutral primary signal the runtime reads. */
+export function applyAnyharnessTranscriptMetadata(
+  update: SessionNotification["update"],
+  parentToolUseId?: string | null,
+): void {
+  const meta = update._meta as ToolUpdateMeta | undefined;
+  const enriched = anyharnessTranscriptMetadata(meta, parentToolUseId);
+  if (enriched !== meta) {
+    update._meta = enriched;
   }
 }
 

@@ -29,6 +29,8 @@ import {
 } from "../tools.js";
 import {
   toAcpNotifications,
+  anyharnessTranscriptMetadata,
+  applyAnyharnessTranscriptMetadata,
   promptToClaude,
   isLocalCommandMetadata,
   isSyntheticLoginMessage,
@@ -1727,6 +1729,103 @@ describe("subagent transcript replay", () => {
         }),
       ]),
     );
+  });
+});
+
+describe("native subagent transcript metadata (anyharness re-emission)", () => {
+  // Replica of the AnyHarness runtime's parent resolution
+  // (anyharness-lib/src/live/sessions/sink/metadata.rs): the provider-neutral
+  // `_meta.anyharness.parentToolCallId` is the authoritative primary signal;
+  // only when it is absent does the claude source fall back to the legacy
+  // `_meta.claudeCode.parentToolUseId`. The runtime contract fixture ships a
+  // frame where that fallback is deliberately wrong ("wrong-legacy-parent"), so
+  // the fallback mis-nests whenever the primary signal is missing.
+  function runtimeResolveParent(
+    meta: { anyharness?: { parentToolCallId?: string }; claudeCode?: { parentToolUseId?: string } },
+    sourceAgentKind = "claude",
+  ): string | undefined {
+    const primary = meta?.anyharness?.parentToolCallId;
+    if (primary) return primary;
+    return sourceAgentKind === "claude" ? meta?.claudeCode?.parentToolUseId : undefined;
+  }
+
+  const subagentAssistant = {
+    type: "assistant",
+    uuid: "subagent-message",
+    session_id: "s1",
+    parent_tool_use_id: "claude-task-1",
+    parent_agent_id: "agent-1",
+    message: {
+      id: "api-subagent-message",
+      model: "claude-sonnet-4-5",
+      role: "assistant",
+      type: "message",
+      stop_reason: "tool_use",
+      content: [
+        { type: "text", text: "Inspecting the transcript pipeline." },
+        { type: "tool_use", id: "claude-read-1", name: "Read", input: { file_path: "reducer.ts" } },
+      ],
+    },
+  } as unknown as Awaited<ReturnType<typeof getSessionMessages>>[number];
+
+  async function replay(): Promise<SessionNotification[]> {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (update: SessionNotification) => updates.push(update),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([subagentAssistant] as any);
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+    return updates;
+  }
+
+  it("positive: child message/tool frames carry _meta.anyharness.parentToolCallId (runtime fixture shape)", async () => {
+    const updates = await replay();
+
+    const chunk = updates.find(({ update }) => update.sessionUpdate === "agent_message_chunk");
+    expect((chunk?.update._meta as any)?.anyharness?.parentToolCallId).toBe("claude-task-1");
+
+    const toolCall = updates.find(
+      ({ update }) => update.sessionUpdate === "tool_call" && update.toolCallId === "claude-read-1",
+    );
+    expect((toolCall?.update._meta as any)?.anyharness).toMatchObject({
+      nativeToolName: "Read",
+      parentToolCallId: "claude-task-1",
+    });
+    // A non-subagent child tool must not be mislabeled as a subagent launch.
+    expect((toolCall?.update._meta as any)?.anyharness?.toolKind).toBeUndefined();
+  });
+
+  it("positive: a native Task tool call is stamped toolKind: subagent", () => {
+    const enriched = anyharnessTranscriptMetadata({ claudeCode: { toolName: "Task" } });
+    expect(enriched?.anyharness).toEqual({ nativeToolName: "Task", toolKind: "subagent" });
+  });
+
+  it("negative control: primary path overrides the fixture's wrong legacy parentToolUseId", () => {
+    // Runtime contract fixture agent_message_chunk: the legacy fallback id is
+    // deliberately WRONG while the true owning Task call is "claude-task-1".
+    const update: SessionNotification["update"] = {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "Inspecting the transcript pipeline." },
+      messageId: "claude-message-1",
+      _meta: { claudeCode: { parentToolUseId: "wrong-legacy-parent" } },
+    } as unknown as SessionNotification["update"];
+
+    // WITHOUT re-emission: the only signal is the wrong legacy fallback, so the
+    // runtime mis-nests under "wrong-legacy-parent".
+    expect(runtimeResolveParent(update._meta as any)).toBe("wrong-legacy-parent");
+
+    // WITH re-emission stamping the true SDK parent, the authoritative primary
+    // signal is present and correct...
+    applyAnyharnessTranscriptMetadata(update, "claude-task-1");
+    expect((update._meta as any).anyharness.parentToolCallId).toBe("claude-task-1");
+    expect(runtimeResolveParent(update._meta as any)).toBe("claude-task-1");
+    // ...and the legacy key is corrected in lockstep so even the fallback path
+    // can no longer mis-nest this frame.
+    expect((update._meta as any).claudeCode.parentToolUseId).toBe("claude-task-1");
   });
 });
 
