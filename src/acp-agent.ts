@@ -81,10 +81,20 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
+  SDKTaskNotificationMessage,
+  SDKTaskProgressMessage,
+  SDKTaskStartedMessage,
+  SDKTaskUpdatedMessage,
   SDKUserMessage,
   SlashCommand,
   ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
+import {
+  AgentInput,
+  AgentOutput,
+  BashInput,
+  BashOutput,
+} from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import {
   GOAL_ACTIONS,
   GOAL_CONTROL_METHOD,
@@ -106,6 +116,26 @@ import {
   RewindFilesRequest,
   RewindFilesResponse,
 } from "./anyharness-fork.js";
+import {
+  ACTIVITY_LIST_EXT_METHOD,
+  ACTIVITY_SCHEMA_VERSION,
+  ActivityChunkMeta,
+  ActivityListRequest,
+  ActivityListResponse,
+  ActivityProcessRecord,
+  ActivityState,
+  ActivitySubagentRecord,
+  newActivityState,
+  parseActivityListRequest,
+  parseBackgroundOutputFile,
+  processWire,
+  PROCESS_UPSERTED_TRANSCRIPT_EVENT,
+  structuredResult,
+  subagentWire,
+  SUBAGENT_UPSERTED_TRANSCRIPT_EVENT,
+  upsertProcess,
+  upsertSubagent,
+} from "./activity.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -641,6 +671,22 @@ type Session = {
       endedPerLevel?: "ended" | "sweep-armed";
     }
   >;
+  /** Read-only activity roster (bgwork RF, processes + subagents only —
+   *  loops/goals are explicitly out of scope for this state, see
+   *  goal-extension.ts and the frozen goal wiring elsewhere in this file):
+   *  background Bash processes and Agent/Task subagents, mirrored from the
+   *  same `task_started`/`task_progress`/`task_notification`/`task_updated`
+   *  system messages and the Bash/Agent tool_results that already drive
+   *  `liveBackgroundTasks` above. Reused across `loadSession`/`resumeSession`
+   *  whenever `getOrCreateSession` reattaches to this same in-memory Session
+   *  (fingerprint match) — the case `_anyharness/activity/list` serves a
+   *  non-empty roster for. A fresh `createSession` (new process, or a
+   *  fingerprint change) always starts empty, matching Claude's task
+   *  machinery: processes/subagents are process-bound and do not survive a
+   *  harness restart (see `ActivityRuntime::reconcile_on_attach` in the
+   *  runtime, which resets any still-`running` roster entry it receives from
+   *  a fresh harness anyway). */
+  activity: ActivityState;
   /** Whether any top-level assistant text reached the client since the last
    *  stretch boundary. Set as a side effect of sending in the consumer's
    *  `sendUpdate`, never at an emission site; read at the terminal `result`
@@ -1642,7 +1688,18 @@ export class ClaudeAcpAgent {
         // `_anyharness/rewindFiles` fast path. Absence of this block means a
         // client is talking to canonical, unpatched claude-agent-acp — the
         // runtime must never infer these from harness name or protocol version.
-        anyharness: anyharnessCapabilities(),
+        // `activity` (bgwork RF) is additive here, not part of the frozen
+        // `anyharnessCapabilities()` in anyharness-fork.ts: the runtime treats
+        // `_anyharness/activity/list` as best-effort regardless (it calls it
+        // unconditionally and falls back to a reset-only reconcile on any
+        // error), so this flag is discoverability only, never load-bearing.
+        anyharness: {
+          ...anyharnessCapabilities(),
+          activity: {
+            version: ACTIVITY_SCHEMA_VERSION,
+            listMethod: ACTIVITY_LIST_EXT_METHOD,
+          },
+        },
       },
     };
   }
@@ -2015,6 +2072,371 @@ export class ClaudeAcpAgent {
       await this.prompt({ sessionId: params.sessionId, prompt });
     }
     return {};
+  }
+
+  // -------------------------------------------------------------------------
+  // Activity roster (bgwork RF): read-only process_upserted / subagent_upserted
+  // emission for background Bash processes and Agent/Task subagents. See
+  // ./activity.ts for the wire contract and the runtime's
+  // domains/activity/{wire,session_observer}.rs for the authoritative shapes.
+  // Scope is processes + subagents ONLY — loops are dropped entirely and goals
+  // are the frozen goal-extension.ts wiring above; neither is touched here.
+  // -------------------------------------------------------------------------
+
+  /** Emits a zero-text `agent_message_chunk` tagged with the roster payload.
+   *  Deliberately bypasses the consumer's `sendUpdate` chokepoint (which marks
+   *  `session.emittedAssistantText = true` for any untagged agent_message_chunk
+   *  content): this chunk carries no assistant text and must never be mistaken
+   *  for the turn's delivered answer. The runtime's dispatcher keeps it out of
+   *  the transcript via `NON_TRANSCRIPT_CHUNK_EVENTS` on its own tagged-meta
+   *  check, so sending directly via `this.client.sessionUpdate` here is exactly
+   *  the wire shape it expects, with none of the turn-bookkeeping side effect. */
+  private async emitProcessUpserted(
+    sessionId: string,
+    record: ActivityProcessRecord,
+  ): Promise<void> {
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "" },
+        _meta: {
+          anyharness: {
+            schemaVersion: ACTIVITY_SCHEMA_VERSION,
+            transcriptEvent: PROCESS_UPSERTED_TRANSCRIPT_EVENT,
+            process: processWire(record),
+          },
+        } satisfies ActivityChunkMeta,
+      },
+    });
+  }
+
+  private async emitSubagentUpserted(
+    sessionId: string,
+    record: ActivitySubagentRecord,
+  ): Promise<void> {
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "" },
+        _meta: {
+          anyharness: {
+            schemaVersion: ACTIVITY_SCHEMA_VERSION,
+            transcriptEvent: SUBAGENT_UPSERTED_TRANSCRIPT_EVENT,
+            subagent: subagentWire(record),
+          },
+        } satisfies ActivityChunkMeta,
+      },
+    });
+  }
+
+  /** `task_started`: the roster's LAUNCH signal. Fires for both background
+   *  Bash processes and Agent/Task subagents (sync or async — a sync subagent
+   *  is registered here too and pruned at its terminal `task_updated`, well
+   *  before its own tool_result streams back; see `liveBackgroundTasks`'s
+   *  doc). Best-effort throughout: a lookup miss (the spawning tool_use raced
+   *  ahead of/behind the cache) just skips emission rather than failing the
+   *  drain. */
+  private async handleActivityTaskStarted(
+    sessionId: string,
+    session: Session,
+    message: SDKTaskStartedMessage,
+  ): Promise<void> {
+    const toolUse = message.tool_use_id ? session.toolUseCache[message.tool_use_id] : undefined;
+    if (message.subagent_type) {
+      if (message.tool_use_id) {
+        session.activity.subagentToolUseIndex.set(message.tool_use_id, message.task_id);
+      }
+      const input = toolUse?.input as Partial<AgentInput> | undefined;
+      const record = upsertSubagent(session.activity, message.task_id, {
+        agentType: message.subagent_type,
+        description: message.description,
+        model: input?.model,
+        // AgentInput's own doc: "Agents run in the background by default;
+        // set to false to run this agent synchronously" — so absent/true
+        // means background. Corrected definitively once the Agent/Task
+        // tool's own tool_result settles (see handleActivityAgentResult):
+        // "completed" -> false, "async_launched"/"remote_launched" -> true.
+        background: input?.run_in_background !== false,
+        status: "running",
+      });
+      await this.emitSubagentUpserted(sessionId, record);
+      return;
+    }
+    if (toolUse?.name === "Bash") {
+      const input = toolUse.input as Partial<BashInput> | undefined;
+      const record = upsertProcess(session.activity, message.task_id, {
+        command: input?.command ?? message.description,
+        cwd: session.cwd,
+        status: "running",
+      });
+      await this.emitProcessUpserted(sessionId, record);
+      return;
+    }
+    // Any other task_type (e.g. `local_workflow`) is out of scope for the
+    // processes/subagents activity roster (see the PR's explicit scope note).
+  }
+
+  /** `task_progress`: subagent-only on this SDK version — background Bash has
+   *  no progress frame of its own, only its terminal `task_notification`. */
+  private async handleActivityTaskProgress(
+    sessionId: string,
+    session: Session,
+    message: SDKTaskProgressMessage,
+  ): Promise<void> {
+    if (!message.subagent_type && !session.activity.subagents.has(message.task_id)) {
+      return;
+    }
+    const record = upsertSubagent(session.activity, message.task_id, {
+      agentType: message.subagent_type,
+      summary: message.summary,
+      tokensUsed: message.usage.total_tokens,
+      toolCalls: message.usage.tool_uses,
+      durationSeconds: Math.round(message.usage.duration_ms / 1000),
+      status: "running",
+    });
+    await this.emitSubagentUpserted(sessionId, record);
+  }
+
+  /** `task_notification`: the primary settle signal for both roster kinds,
+   *  carrying the structured `output_file` this SDK version only ever
+   *  populates HERE (never at launch — see `parseBackgroundOutputFile`'s doc
+   *  for why a background Bash process still needs the raw-text parse for its
+   *  LIVE feed). Classifies process vs. subagent from our own roster maps
+   *  first (populated at `task_started`), falling back to
+   *  `liveBackgroundTasks`'s `isSubagent` flag — captured by the caller before
+   *  it prunes that entry — for the rare case `task_started` never registered
+   *  our record (a lookup miss there). */
+  private async handleActivityTaskNotification(
+    sessionId: string,
+    session: Session,
+    message: SDKTaskNotificationMessage,
+    isSubagentHint: boolean | undefined,
+  ): Promise<void> {
+    const feed = message.output_file
+      ? { transport: "tail_file" as const, path: message.output_file }
+      : undefined;
+    const isSubagent =
+      session.activity.subagents.has(message.task_id) ||
+      (!session.activity.processes.has(message.task_id) && isSubagentHint === true);
+
+    if (isSubagent) {
+      const status: ActivitySubagentRecord["status"] =
+        message.status === "completed" ? "completed" : "failed";
+      const record = upsertSubagent(session.activity, message.task_id, {
+        status,
+        summary: message.summary,
+        tokensUsed: message.usage?.total_tokens,
+        toolCalls: message.usage?.tool_uses,
+        durationSeconds:
+          message.usage !== undefined ? Math.round(message.usage.duration_ms / 1000) : undefined,
+        feed,
+      });
+      await this.emitSubagentUpserted(sessionId, record);
+      return;
+    }
+    if (session.activity.processes.has(message.task_id)) {
+      const record = upsertProcess(session.activity, message.task_id, {
+        status: "exited",
+        endedAtMs: Date.now(),
+        feed,
+      });
+      await this.emitProcessUpserted(sessionId, record);
+    }
+  }
+
+  /** `task_updated` terminal patch: a settle backstop for whichever of
+   *  `task_notification`/`task_updated` the SDK actually guarantees for this
+   *  transition (only the patch is guaranteed per the type's own doc). Only
+   *  acts when the roster entry is still `running`, so this never regresses a
+   *  richer settle `task_notification` already applied — whichever of the two
+   *  arrives first settles the record; the second is a no-op upsert. */
+  private async handleActivityTaskUpdatedTerminal(
+    sessionId: string,
+    session: Session,
+    message: SDKTaskUpdatedMessage,
+  ): Promise<void> {
+    const subagentRecord = session.activity.subagents.get(message.task_id);
+    if (subagentRecord) {
+      if (subagentRecord.status === "running") {
+        const status: ActivitySubagentRecord["status"] =
+          message.patch.status === "completed" ? "completed" : "failed";
+        const record = upsertSubagent(session.activity, message.task_id, { status });
+        await this.emitSubagentUpserted(sessionId, record);
+      }
+      return;
+    }
+    const processRecord = session.activity.processes.get(message.task_id);
+    if (processRecord && processRecord.status === "running") {
+      const record = upsertProcess(session.activity, message.task_id, {
+        status: "exited",
+        endedAtMs: message.patch.end_time ?? Date.now(),
+      });
+      await this.emitProcessUpserted(sessionId, record);
+    }
+  }
+
+  /** Scans one message's content blocks for Bash/Agent/Task `tool_result`s
+   *  and routes them to the process/subagent handlers below. This is the
+   *  primary LAUNCH-time source of a subagent's live-tail `feed` (the
+   *  Agent/Task tool's own structured `AgentOutput` carries `outputFile`
+   *  immediately for an async-launched subagent — well before any
+   *  `task_progress` could) and the ONLY source of a background process's
+   *  live-tail `feed` (see `parseBackgroundOutputFile`). Must run BEFORE
+   *  `toAcpNotifications` consumes the same content, which prunes
+   *  `toolUseCache` at each tool_result it processes. */
+  private async handleActivityToolResults(
+    sessionId: string,
+    session: Session,
+    content: unknown,
+    toolUseResult: unknown,
+  ): Promise<void> {
+    if (!Array.isArray(content)) {
+      return;
+    }
+    for (const block of content) {
+      if (
+        !block ||
+        typeof block !== "object" ||
+        (block as { type?: unknown }).type !== "tool_result"
+      ) {
+        continue;
+      }
+      const toolUseId = (block as { tool_use_id?: unknown }).tool_use_id;
+      if (typeof toolUseId !== "string") {
+        continue;
+      }
+      const toolUse = session.toolUseCache[toolUseId];
+      if (!toolUse) {
+        continue;
+      }
+      if (toolUse.name === "Bash") {
+        await this.handleActivityBashResult(sessionId, session, toolUse, block, toolUseResult);
+      } else if (toolUse.name === "Agent" || toolUse.name === "Task") {
+        const isError = "is_error" in block && (block as { is_error?: unknown }).is_error === true;
+        await this.handleActivityAgentResult(
+          sessionId,
+          session,
+          toolUseId,
+          toolUse,
+          toolUseResult,
+          isError,
+        );
+      }
+    }
+  }
+
+  private async handleActivityBashResult(
+    sessionId: string,
+    session: Session,
+    toolUse: { name: string; input: unknown },
+    block: unknown,
+    toolUseResult: unknown,
+  ): Promise<void> {
+    const structured = structuredResult<BashOutput>(toolUseResult);
+    if (!structured || structured.backgroundTaskId === undefined) {
+      // Not a backgrounded command (or an older CLI without the structured
+      // field) — nothing new for the roster here; `task_started` (keyed by
+      // the SDK task id) is the primary launch source for a process.
+      return;
+    }
+    const outputFile = parseBackgroundOutputFile((block as { content?: unknown }).content);
+    if (!outputFile) {
+      return;
+    }
+    const input = toolUse.input as Partial<BashInput> | undefined;
+    const record = upsertProcess(session.activity, structured.backgroundTaskId, {
+      command: input?.command,
+      cwd: session.cwd,
+      feed: { transport: "tail_file", path: outputFile },
+    });
+    await this.emitProcessUpserted(sessionId, record);
+  }
+
+  private async handleActivityAgentResult(
+    sessionId: string,
+    session: Session,
+    toolUseId: string,
+    toolUse: { input: unknown },
+    toolUseResult: unknown,
+    isError: boolean,
+  ): Promise<void> {
+    const structured = structuredResult<AgentOutput>(toolUseResult);
+    const input = toolUse.input as Partial<AgentInput> | undefined;
+    if (!structured) {
+      // A hard SDK-level failure (the tool call itself never ran/resolved)
+      // carries no AgentOutput at all — resolve the roster entry via the
+      // tool_use-id index recorded at `task_started` instead.
+      if (isError) {
+        const taskId = session.activity.subagentToolUseIndex.get(toolUseId);
+        if (taskId && session.activity.subagents.has(taskId)) {
+          const record = upsertSubagent(session.activity, taskId, { status: "failed" });
+          await this.emitSubagentUpserted(sessionId, record);
+        }
+      }
+      return;
+    }
+    if (structured.status === "completed") {
+      const record = upsertSubagent(session.activity, structured.agentId, {
+        agentType: structured.agentType ?? input?.subagent_type,
+        model: structured.resolvedModel ?? input?.model,
+        background: false,
+        status: isError ? "failed" : "completed",
+        tokensUsed: structured.totalTokens,
+        toolCalls: structured.totalToolUseCount,
+        durationSeconds: Math.round(structured.totalDurationMs / 1000),
+      });
+      await this.emitSubagentUpserted(sessionId, record);
+      return;
+    }
+    if (structured.status === "async_launched") {
+      const record = upsertSubagent(session.activity, structured.agentId, {
+        description: structured.description,
+        model: structured.resolvedModel ?? input?.model,
+        background: true,
+        status: "running",
+        feed: { transport: "tail_file", path: structured.outputFile },
+      });
+      await this.emitSubagentUpserted(sessionId, record);
+      return;
+    }
+    if (structured.status === "remote_launched") {
+      // Cloud-dispatched agent: a distinct id space (`taskId`, not `agentId`)
+      // with no observed correlating `task_started`/`task_notification` on
+      // this base — best-effort roster entry, keyed by its own `taskId`.
+      // Flagged in the PR as an open contract question (remote/CCR agents may
+      // warrant their own wire identity rather than reusing this roster).
+      const record = upsertSubagent(session.activity, structured.taskId, {
+        description: structured.description,
+        background: true,
+        status: "running",
+        feed: { transport: "tail_file", path: structured.outputFile },
+      });
+      await this.emitSubagentUpserted(sessionId, record);
+    }
+  }
+
+  /** `_anyharness/activity/list`: serves the CURRENT roster snapshot for the
+   *  runtime's attach-time reconcile pull (`ActivityRuntime::reconcile_on_attach`).
+   *  Non-empty exactly when `getOrCreateSession` reattached to a still-live
+   *  in-memory `Session` (fingerprint match, no process restart) — the case
+   *  where our maps genuinely still describe live work. Empty for a fresh
+   *  `createSession` (a real process restart or a fingerprint change),
+   *  matching Claude's task machinery: background processes and subagents are
+   *  process-bound and never survive a harness restart, so an empty roster
+   *  here is not a degraded response but the correct one — the runtime's own
+   *  reset-then-relist reconcile (`reset_running_processes`/
+   *  `reset_running_subagents`) handles marking any prior entries stale. */
+  async activityList(params: ActivityListRequest): Promise<ActivityListResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      return { processes: [], subagents: [] };
+    }
+    return {
+      processes: [...session.activity.processes.values()].map(processWire),
+      subagents: [...session.activity.subagents.values()].map(subagentWire),
+    };
   }
 
   private async publishGoal(sessionId: string, goal: GoalSnapshot | null): Promise<void> {
@@ -3193,7 +3615,11 @@ export class ClaudeAcpAgent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
+                break;
               case "task_progress":
+                // Read-only activity roster (bgwork RF): subagent progress
+                // (usage/summary). Best-effort — never fail the drain.
+                void this.handleActivityTaskProgress(params.sessionId, session, message);
                 break;
               case "task_started":
                 // For subagent tasks `task_id` is the subagent's agent id (the
@@ -3221,12 +3647,28 @@ export class ClaudeAcpAgent {
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
                 }
+                // Read-only activity roster (bgwork RF): LAUNCH signal for a
+                // background process or subagent. Best-effort — never fail
+                // the drain.
+                void this.handleActivityTaskStarted(params.sessionId, session, message);
                 break;
-              case "task_notification":
+              case "task_notification": {
+                // Read-only activity roster (bgwork RF): the settle signal —
+                // captures `isSubagent` from the registry entry BEFORE it is
+                // pruned below, as a classification fallback. Best-effort —
+                // never fail the drain.
+                const isSubagentHint = session.liveBackgroundTasks.get(message.task_id)?.isSubagent;
+                void this.handleActivityTaskNotification(
+                  params.sessionId,
+                  session,
+                  message,
+                  isSubagentHint,
+                );
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 session.liveBackgroundTasks.delete(message.task_id);
                 break;
+              }
               case "task_updated":
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
@@ -3238,6 +3680,11 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
+                  // Read-only activity roster (bgwork RF): settle backstop for
+                  // whichever of task_notification/task_updated the SDK
+                  // actually guarantees for this transition. Best-effort —
+                  // never fail the drain.
+                  void this.handleActivityTaskUpdatedTerminal(params.sessionId, session, message);
                   session.liveBackgroundTasks.delete(message.task_id);
                 }
                 break;
@@ -4164,6 +4611,21 @@ export class ClaudeAcpAgent {
               );
             } else {
               content = message.message.content;
+            }
+
+            // Read-only activity roster (bgwork RF): scan this message's
+            // tool_results for Bash/Agent/Task completions BEFORE
+            // toAcpNotifications consumes the same content — it prunes
+            // `toolUseCache` at each tool_result it processes, and this is
+            // the primary (often only) source of a subagent's/process's
+            // live-tail `feed`. Best-effort — never fail the drain.
+            if (message.type === "user") {
+              await this.handleActivityToolResults(
+                params.sessionId,
+                session,
+                content,
+                message.tool_use_result,
+              );
             }
 
             for (const notification of toAcpNotifications(
@@ -6218,6 +6680,7 @@ export class ClaudeAcpAgent {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      activity: newActivityState(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
@@ -8120,6 +8583,11 @@ export function runAcp() {
       REWIND_FILES_METHOD,
       { parse: parseRewindFilesRequest },
       (ctx) => agent.rewindFiles(ctx.params),
+    )
+    .onRequest<ActivityListRequest, ActivityListResponse>(
+      ACTIVITY_LIST_EXT_METHOD,
+      { parse: parseActivityListRequest },
+      (ctx) => agent.activityList(ctx.params),
     )
     .connect(stream);
 
