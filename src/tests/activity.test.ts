@@ -422,19 +422,24 @@ function createCapturingAgent() {
   return { agent, updates };
 }
 
-/** A client whose `sessionUpdate` rejects for every roster (`_meta.anyharness`)
- *  chunk — simulating the peer winding the connection down while a
- *  post-turn background-Bash settle notification is emitted — but still
- *  succeeds for ordinary (non-roster) updates, so the rest of the turn's
- *  delivery is unaffected. Captures every `logger.error` call so a test can
- *  assert the rejection was logged rather than silently dropped. */
+/** A client whose `sessionUpdate` rejects for every roster chunk — simulating
+ *  the peer winding the connection down while a post-turn background-Bash
+ *  settle notification is emitted — but still succeeds for ordinary
+ *  (non-roster) updates, so the rest of the turn's delivery is unaffected.
+ *  Roster chunks are the `transcriptEvent`-tagged `_meta.anyharness` updates
+ *  (the same discriminator the runtime's NON_TRANSCRIPT_CHUNK_EVENTS gate keys
+ *  on); tool_call updates also carry `_meta.anyharness` (nativeToolName/
+ *  toolKind/parentToolCallId, no transcriptEvent) and must NOT trip this mock —
+ *  they flow through the unguarded canonical send path by design. Captures
+ *  every `logger.error` call so a test can assert the rejection was logged
+ *  rather than silently dropped. */
 function createRejectingCapturingAgent() {
   const updates: SessionNotification[] = [];
   const errors: unknown[] = [];
   const mockClient = {
     sessionUpdate: async (n: SessionNotification) => {
       const meta = (n.update as any)?._meta?.anyharness;
-      if (meta) {
+      if (meta?.transcriptEvent) {
         throw new Error("simulated peer disconnect during sessionUpdate");
       }
       updates.push(n);
@@ -452,7 +457,13 @@ function createRejectingCapturingAgent() {
 function activityChunks(updates: SessionNotification[], transcriptEvent?: string) {
   return updates.filter((n) => {
     const meta = (n.update as any)?._meta?.anyharness;
-    return meta && (transcriptEvent === undefined || meta.transcriptEvent === transcriptEvent);
+    // `transcriptEvent` presence, not `_meta.anyharness` presence, is what
+    // makes an update a roster chunk — tool_call updates carry non-roster
+    // `_meta.anyharness` stamps too (see createRejectingCapturingAgent's doc).
+    return (
+      meta?.transcriptEvent !== undefined &&
+      (transcriptEvent === undefined || meta.transcriptEvent === transcriptEvent)
+    );
   });
 }
 
