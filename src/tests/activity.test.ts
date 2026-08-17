@@ -422,6 +422,33 @@ function createCapturingAgent() {
   return { agent, updates };
 }
 
+/** A client whose `sessionUpdate` rejects for every roster (`_meta.anyharness`)
+ *  chunk — simulating the peer winding the connection down while a
+ *  post-turn background-Bash settle notification is emitted — but still
+ *  succeeds for ordinary (non-roster) updates, so the rest of the turn's
+ *  delivery is unaffected. Captures every `logger.error` call so a test can
+ *  assert the rejection was logged rather than silently dropped. */
+function createRejectingCapturingAgent() {
+  const updates: SessionNotification[] = [];
+  const errors: unknown[] = [];
+  const mockClient = {
+    sessionUpdate: async (n: SessionNotification) => {
+      const meta = (n.update as any)?._meta?.anyharness;
+      if (meta) {
+        throw new Error("simulated peer disconnect during sessionUpdate");
+      }
+      updates.push(n);
+    },
+  } as unknown as AcpClient;
+  const agent = new ClaudeAcpAgent(mockClient, {
+    log: () => {},
+    error: (message: unknown) => {
+      errors.push(message);
+    },
+  });
+  return { agent, updates, errors };
+}
+
 function activityChunks(updates: SessionNotification[], transcriptEvent?: string) {
   return updates.filter((n) => {
     const meta = (n.update as any)?._meta?.anyharness;
@@ -812,5 +839,94 @@ describe("activity emission: `_anyharness/activity/list` (attach-time reconcile 
     const { agent } = createCapturingAgent();
     const result = await agent.activityList({ sessionId: "unknown-session" });
     expect(result).toEqual({ processes: [], subagents: [] });
+  });
+});
+
+describe("activity emission: resilience to a rejecting client.sessionUpdate", () => {
+  // Every activity handler (handleActivityTaskStarted/Progress/Notification/
+  // TaskUpdatedTerminal/ToolResults) wraps its body in try/catch and logs via
+  // this.logger.error rather than letting the rejection propagate — four of
+  // those are fired `void`-ed from runConsumer's switch (an unhandled
+  // rejection if left unguarded) and the fifth is `await`-ed directly from
+  // the main content loop (a drain-killing throw if left unguarded). This
+  // test simulates the reviewer's flagged scenario most likely to actually
+  // hit it: the post-turn task_notification for a backgrounded Bash task,
+  // emitted while the peer is winding the connection down.
+  it("survives a rejecting sessionUpdate on the post-turn task_notification without an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    try {
+      const { agent, errors } = createRejectingCapturingAgent();
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: userMessage } = await iter.next();
+          yield userEcho(userMessage);
+          yield assistantMessage([toolUseBlock("toolu_bash1", "Bash", { command: "sleep 30 &" })]);
+          yield taskStarted({ task_id: "proc-1", tool_use_id: "toolu_bash1" });
+          yield successResult();
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+          // Strictly post-turn, exactly like the earlier "post-turn
+          // completion" test — except here `sessionUpdate` throws for this
+          // roster chunk (see createRejectingCapturingAgent).
+          yield taskNotification({ task_id: "proc-1", output_file: "/tmp/proc-1.log" });
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "go" }],
+      });
+      expect(response.stopReason).toBeDefined();
+
+      // Let the post-turn task_notification (and its rejecting sessionUpdate
+      // call) drain fully.
+      await agent.sessions["test-session"]?.consumer;
+      // Give any would-be unhandled rejection a microtask/timer turn to
+      // surface before asserting its absence.
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(unhandled).toEqual([]);
+      expect(errors.some((e) => String(e).includes("task_notification"))).toBe(true);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("survives a rejecting sessionUpdate on a subagent launch (task_started) without an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    try {
+      const { agent, errors } = createRejectingCapturingAgent();
+      injectGeneratorSession(
+        agent,
+        makeGenerator([
+          taskStarted({
+            task_id: "agent-1",
+            tool_use_id: "toolu_agent1",
+            subagent_type: "Explore",
+          }),
+          successResult(),
+        ]),
+      );
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "go" }],
+      });
+      expect(response.stopReason).toBeDefined();
+      await agent.sessions["test-session"]?.consumer;
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(unhandled).toEqual([]);
+      expect(errors.some((e) => String(e).includes("task_started"))).toBe(true);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
   });
 });

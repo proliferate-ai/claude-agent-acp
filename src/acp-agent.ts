@@ -2143,39 +2143,48 @@ export class ClaudeAcpAgent {
     session: Session,
     message: SDKTaskStartedMessage,
   ): Promise<void> {
-    const toolUse = message.tool_use_id ? session.toolUseCache[message.tool_use_id] : undefined;
-    if (message.subagent_type) {
-      if (message.tool_use_id) {
-        session.activity.subagentToolUseIndex.set(message.tool_use_id, message.task_id);
+    try {
+      const toolUse = message.tool_use_id ? session.toolUseCache[message.tool_use_id] : undefined;
+      if (message.subagent_type) {
+        if (message.tool_use_id) {
+          session.activity.subagentToolUseIndex.set(message.tool_use_id, message.task_id);
+        }
+        const input = toolUse?.input as Partial<AgentInput> | undefined;
+        const record = upsertSubagent(session.activity, message.task_id, {
+          agentType: message.subagent_type,
+          description: message.description,
+          model: input?.model,
+          // AgentInput's own doc: "Agents run in the background by default;
+          // set to false to run this agent synchronously" — so absent/true
+          // means background. Corrected definitively once the Agent/Task
+          // tool's own tool_result settles (see handleActivityAgentResult):
+          // "completed" -> false, "async_launched"/"remote_launched" -> true.
+          background: input?.run_in_background !== false,
+          status: "running",
+        });
+        await this.emitSubagentUpserted(sessionId, record);
+        return;
       }
-      const input = toolUse?.input as Partial<AgentInput> | undefined;
-      const record = upsertSubagent(session.activity, message.task_id, {
-        agentType: message.subagent_type,
-        description: message.description,
-        model: input?.model,
-        // AgentInput's own doc: "Agents run in the background by default;
-        // set to false to run this agent synchronously" — so absent/true
-        // means background. Corrected definitively once the Agent/Task
-        // tool's own tool_result settles (see handleActivityAgentResult):
-        // "completed" -> false, "async_launched"/"remote_launched" -> true.
-        background: input?.run_in_background !== false,
-        status: "running",
-      });
-      await this.emitSubagentUpserted(sessionId, record);
-      return;
+      if (toolUse?.name === "Bash") {
+        const input = toolUse.input as Partial<BashInput> | undefined;
+        const record = upsertProcess(session.activity, message.task_id, {
+          command: input?.command ?? message.description,
+          cwd: session.cwd,
+          status: "running",
+        });
+        await this.emitProcessUpserted(sessionId, record);
+        return;
+      }
+      // Any other task_type (e.g. `local_workflow`) is out of scope for the
+      // processes/subagents activity roster (see the PR's explicit scope note).
+    } catch (error) {
+      // Best-effort: a client.sessionUpdate rejection (e.g. the peer winding
+      // down) must never fail the drain or become an unhandled rejection —
+      // this handler is fired `void`-ed from runConsumer's switch.
+      this.logger.error(
+        `Session ${sessionId}: activity roster task_started emission failed: ${error}`,
+      );
     }
-    if (toolUse?.name === "Bash") {
-      const input = toolUse.input as Partial<BashInput> | undefined;
-      const record = upsertProcess(session.activity, message.task_id, {
-        command: input?.command ?? message.description,
-        cwd: session.cwd,
-        status: "running",
-      });
-      await this.emitProcessUpserted(sessionId, record);
-      return;
-    }
-    // Any other task_type (e.g. `local_workflow`) is out of scope for the
-    // processes/subagents activity roster (see the PR's explicit scope note).
   }
 
   /** `task_progress`: subagent-only on this SDK version — background Bash has
@@ -2185,18 +2194,25 @@ export class ClaudeAcpAgent {
     session: Session,
     message: SDKTaskProgressMessage,
   ): Promise<void> {
-    if (!message.subagent_type && !session.activity.subagents.has(message.task_id)) {
-      return;
+    try {
+      if (!message.subagent_type && !session.activity.subagents.has(message.task_id)) {
+        return;
+      }
+      const record = upsertSubagent(session.activity, message.task_id, {
+        agentType: message.subagent_type,
+        summary: message.summary,
+        tokensUsed: message.usage.total_tokens,
+        toolCalls: message.usage.tool_uses,
+        durationSeconds: Math.round(message.usage.duration_ms / 1000),
+        status: "running",
+      });
+      await this.emitSubagentUpserted(sessionId, record);
+    } catch (error) {
+      // Best-effort: see handleActivityTaskStarted's identical rationale.
+      this.logger.error(
+        `Session ${sessionId}: activity roster task_progress emission failed: ${error}`,
+      );
     }
-    const record = upsertSubagent(session.activity, message.task_id, {
-      agentType: message.subagent_type,
-      summary: message.summary,
-      tokensUsed: message.usage.total_tokens,
-      toolCalls: message.usage.tool_uses,
-      durationSeconds: Math.round(message.usage.duration_ms / 1000),
-      status: "running",
-    });
-    await this.emitSubagentUpserted(sessionId, record);
   }
 
   /** `task_notification`: the primary settle signal for both roster kinds,
@@ -2214,35 +2230,46 @@ export class ClaudeAcpAgent {
     message: SDKTaskNotificationMessage,
     isSubagentHint: boolean | undefined,
   ): Promise<void> {
-    const feed = message.output_file
-      ? { transport: "tail_file" as const, path: message.output_file }
-      : undefined;
-    const isSubagent =
-      session.activity.subagents.has(message.task_id) ||
-      (!session.activity.processes.has(message.task_id) && isSubagentHint === true);
+    try {
+      const feed = message.output_file
+        ? { transport: "tail_file" as const, path: message.output_file }
+        : undefined;
+      const isSubagent =
+        session.activity.subagents.has(message.task_id) ||
+        (!session.activity.processes.has(message.task_id) && isSubagentHint === true);
 
-    if (isSubagent) {
-      const status: ActivitySubagentRecord["status"] =
-        message.status === "completed" ? "completed" : "failed";
-      const record = upsertSubagent(session.activity, message.task_id, {
-        status,
-        summary: message.summary,
-        tokensUsed: message.usage?.total_tokens,
-        toolCalls: message.usage?.tool_uses,
-        durationSeconds:
-          message.usage !== undefined ? Math.round(message.usage.duration_ms / 1000) : undefined,
-        feed,
-      });
-      await this.emitSubagentUpserted(sessionId, record);
-      return;
-    }
-    if (session.activity.processes.has(message.task_id)) {
-      const record = upsertProcess(session.activity, message.task_id, {
-        status: "exited",
-        endedAtMs: Date.now(),
-        feed,
-      });
-      await this.emitProcessUpserted(sessionId, record);
+      if (isSubagent) {
+        const status: ActivitySubagentRecord["status"] =
+          message.status === "completed" ? "completed" : "failed";
+        const record = upsertSubagent(session.activity, message.task_id, {
+          status,
+          summary: message.summary,
+          tokensUsed: message.usage?.total_tokens,
+          toolCalls: message.usage?.tool_uses,
+          durationSeconds:
+            message.usage !== undefined ? Math.round(message.usage.duration_ms / 1000) : undefined,
+          feed,
+        });
+        await this.emitSubagentUpserted(sessionId, record);
+        return;
+      }
+      if (session.activity.processes.has(message.task_id)) {
+        const record = upsertProcess(session.activity, message.task_id, {
+          status: "exited",
+          endedAtMs: Date.now(),
+          feed,
+        });
+        await this.emitProcessUpserted(sessionId, record);
+      }
+    } catch (error) {
+      // Best-effort: see handleActivityTaskStarted's identical rationale.
+      // This is the most likely site to actually observe a rejection in
+      // practice — the settle notification for a backgrounded Bash task can
+      // arrive strictly after prompt() has already resolved, while the peer
+      // is winding the connection down.
+      this.logger.error(
+        `Session ${sessionId}: activity roster task_notification emission failed: ${error}`,
+      );
     }
   }
 
@@ -2257,23 +2284,30 @@ export class ClaudeAcpAgent {
     session: Session,
     message: SDKTaskUpdatedMessage,
   ): Promise<void> {
-    const subagentRecord = session.activity.subagents.get(message.task_id);
-    if (subagentRecord) {
-      if (subagentRecord.status === "running") {
-        const status: ActivitySubagentRecord["status"] =
-          message.patch.status === "completed" ? "completed" : "failed";
-        const record = upsertSubagent(session.activity, message.task_id, { status });
-        await this.emitSubagentUpserted(sessionId, record);
+    try {
+      const subagentRecord = session.activity.subagents.get(message.task_id);
+      if (subagentRecord) {
+        if (subagentRecord.status === "running") {
+          const status: ActivitySubagentRecord["status"] =
+            message.patch.status === "completed" ? "completed" : "failed";
+          const record = upsertSubagent(session.activity, message.task_id, { status });
+          await this.emitSubagentUpserted(sessionId, record);
+        }
+        return;
       }
-      return;
-    }
-    const processRecord = session.activity.processes.get(message.task_id);
-    if (processRecord && processRecord.status === "running") {
-      const record = upsertProcess(session.activity, message.task_id, {
-        status: "exited",
-        endedAtMs: message.patch.end_time ?? Date.now(),
-      });
-      await this.emitProcessUpserted(sessionId, record);
+      const processRecord = session.activity.processes.get(message.task_id);
+      if (processRecord && processRecord.status === "running") {
+        const record = upsertProcess(session.activity, message.task_id, {
+          status: "exited",
+          endedAtMs: message.patch.end_time ?? Date.now(),
+        });
+        await this.emitProcessUpserted(sessionId, record);
+      }
+    } catch (error) {
+      // Best-effort: see handleActivityTaskStarted's identical rationale.
+      this.logger.error(
+        `Session ${sessionId}: activity roster task_updated emission failed: ${error}`,
+      );
     }
   }
 
@@ -2292,38 +2326,50 @@ export class ClaudeAcpAgent {
     content: unknown,
     toolUseResult: unknown,
   ): Promise<void> {
-    if (!Array.isArray(content)) {
-      return;
-    }
-    for (const block of content) {
-      if (
-        !block ||
-        typeof block !== "object" ||
-        (block as { type?: unknown }).type !== "tool_result"
-      ) {
-        continue;
+    try {
+      if (!Array.isArray(content)) {
+        return;
       }
-      const toolUseId = (block as { tool_use_id?: unknown }).tool_use_id;
-      if (typeof toolUseId !== "string") {
-        continue;
+      for (const block of content) {
+        if (
+          !block ||
+          typeof block !== "object" ||
+          (block as { type?: unknown }).type !== "tool_result"
+        ) {
+          continue;
+        }
+        const toolUseId = (block as { tool_use_id?: unknown }).tool_use_id;
+        if (typeof toolUseId !== "string") {
+          continue;
+        }
+        const toolUse = session.toolUseCache[toolUseId];
+        if (!toolUse) {
+          continue;
+        }
+        if (toolUse.name === "Bash") {
+          await this.handleActivityBashResult(sessionId, session, toolUse, block, toolUseResult);
+        } else if (toolUse.name === "Agent" || toolUse.name === "Task") {
+          const isError =
+            "is_error" in block && (block as { is_error?: unknown }).is_error === true;
+          await this.handleActivityAgentResult(
+            sessionId,
+            session,
+            toolUseId,
+            toolUse,
+            toolUseResult,
+            isError,
+          );
+        }
       }
-      const toolUse = session.toolUseCache[toolUseId];
-      if (!toolUse) {
-        continue;
-      }
-      if (toolUse.name === "Bash") {
-        await this.handleActivityBashResult(sessionId, session, toolUse, block, toolUseResult);
-      } else if (toolUse.name === "Agent" || toolUse.name === "Task") {
-        const isError = "is_error" in block && (block as { is_error?: unknown }).is_error === true;
-        await this.handleActivityAgentResult(
-          sessionId,
-          session,
-          toolUseId,
-          toolUse,
-          toolUseResult,
-          isError,
-        );
-      }
+    } catch (error) {
+      // Best-effort: this method is `await`-ed directly from runConsumer's
+      // main content-processing loop (not `void`-ed like the system-message
+      // handlers above), so an uncaught rejection here would break out of
+      // the for-await drain entirely rather than merely orphaning a promise.
+      // Same swallow-and-log rationale as handleActivityTaskStarted.
+      this.logger.error(
+        `Session ${sessionId}: activity roster tool_result emission failed: ${error}`,
+      );
     }
   }
 
