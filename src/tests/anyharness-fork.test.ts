@@ -38,7 +38,9 @@ describe("fileCheckpointingFromMeta", () => {
   it("defaults to false unless explicitly opted in", () => {
     expect(fileCheckpointingFromMeta(undefined)).toBe(false);
     expect(fileCheckpointingFromMeta({ anyharness: {} })).toBe(false);
-    expect(fileCheckpointingFromMeta({ anyharness: { enableFileCheckpointing: "yes" } })).toBe(false);
+    expect(fileCheckpointingFromMeta({ anyharness: { enableFileCheckpointing: "yes" } })).toBe(
+      false,
+    );
   });
 
   it("is true only for the exact boolean true", () => {
@@ -48,7 +50,9 @@ describe("fileCheckpointingFromMeta", () => {
 
 describe("parseRewindFilesRequest", () => {
   it("accepts a well-formed request", () => {
-    expect(parseRewindFilesRequest({ sessionId: "s1", upToMessageId: "msg_1", dryRun: true })).toEqual({
+    expect(
+      parseRewindFilesRequest({ sessionId: "s1", upToMessageId: "msg_1", dryRun: true }),
+    ).toEqual({
       sessionId: "s1",
       upToMessageId: "msg_1",
       dryRun: true,
@@ -58,7 +62,9 @@ describe("parseRewindFilesRequest", () => {
   it("rejects missing/empty sessionId and upToMessageId, and non-boolean dryRun", () => {
     expect(() => parseRewindFilesRequest(null)).toThrow(RequestError);
     expect(() => parseRewindFilesRequest({ upToMessageId: "m" })).toThrow(RequestError);
-    expect(() => parseRewindFilesRequest({ sessionId: "s", upToMessageId: "" })).toThrow(RequestError);
+    expect(() => parseRewindFilesRequest({ sessionId: "s", upToMessageId: "" })).toThrow(
+      RequestError,
+    );
     expect(() =>
       parseRewindFilesRequest({ sessionId: "s", upToMessageId: "m", dryRun: "no" }),
     ).toThrow(RequestError);

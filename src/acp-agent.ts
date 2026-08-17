@@ -109,6 +109,7 @@ import {
 } from "./goal-extension.js";
 import {
   anyharnessCapabilities,
+  anyharnessForkSessionCapabilityMeta,
   fileCheckpointingFromMeta,
   forkAnchorFromMeta,
   parseRewindFilesRequest,
@@ -1674,7 +1675,12 @@ export class ClaudeAcpAgent {
           additionalDirectories: {},
           close: {},
           delete: {},
-          fork: {},
+          // AnyHarness delta: the strict targeted-fork advertisement lives on
+          // this capability's own `_meta` (the runtime probes exactly this
+          // location and shape); the top-level `_meta.anyharness.fork` block
+          // below stays as the human/discovery-facing description. Additive:
+          // canonical clients still read `fork: {…}` as tip-fork support.
+          fork: { _meta: anyharnessForkSessionCapabilityMeta() },
           list: {},
           resume: {},
         },

@@ -76,6 +76,48 @@ export function anyharnessCapabilities(): AnyharnessCapabilities {
   };
 }
 
+/** The strict targeted-fork advertisement carried on the fork
+ *  SESSION-CAPABILITY's own `_meta` (i.e.
+ *  `agentCapabilities.sessionCapabilities.fork._meta.anyharness`), as probed by
+ *  the AnyHarness runtime (`has_anyharness_targeted_fork_extension`). This is
+ *  ADDITIVE to the top-level initialize `_meta.anyharness.fork` block above —
+ *  both describe the same wire mechanism (`session/fork` +
+ *  `_meta.anyharness.upToMessageId`); this one pins the runtime-facing
+ *  contract fields:
+ *
+ *  - `schemaVersion: 1` — the capability-meta schema, versioned independently
+ *    of the top-level block.
+ *  - `targetedFork.fileEffects: "none"` — an anchored fork copies transcript
+ *    state only; it never mutates files (file restore is the runtime-owned
+ *    checkpoint layer).
+ *  - `targetedFork.target: "message_id"` — anchors are addressed by ACP
+ *    message id (resolved internally through `messageIdToUuid`), never by
+ *    user-message index or turn id. */
+export type AnyharnessTargetedForkCapability = {
+  fileEffects: "none";
+  target: "message_id";
+};
+
+export type AnyharnessForkSessionCapabilityMeta = {
+  anyharness: {
+    schemaVersion: typeof ANYHARNESS_FORK_EXTENSION_VERSION;
+    targetedFork: AnyharnessTargetedForkCapability;
+  };
+};
+
+/** The `_meta` block for the fork session capability at initialize. */
+export function anyharnessForkSessionCapabilityMeta(): AnyharnessForkSessionCapabilityMeta {
+  return {
+    anyharness: {
+      schemaVersion: ANYHARNESS_FORK_EXTENSION_VERSION,
+      targetedFork: {
+        fileEffects: "none",
+        target: "message_id",
+      },
+    },
+  };
+}
+
 function metaNamespace(meta: unknown): Record<string, unknown> | undefined {
   if (!meta || typeof meta !== "object") return undefined;
   const ns = (meta as Record<string, unknown>)[ANYHARNESS_META_NAMESPACE];
@@ -147,7 +189,10 @@ export function parseRewindFilesRequest(params: unknown): RewindFilesRequest {
     );
   }
   if (dryRun !== undefined && typeof dryRun !== "boolean") {
-    throw RequestError.invalidParams(undefined, "rewindFiles dryRun must be a boolean when present");
+    throw RequestError.invalidParams(
+      undefined,
+      "rewindFiles dryRun must be a boolean when present",
+    );
   }
   return { sessionId, upToMessageId, dryRun: dryRun as boolean | undefined };
 }
