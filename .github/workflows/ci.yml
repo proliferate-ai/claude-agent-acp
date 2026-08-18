@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # canonical-* are the AnyHarness fork base lines (e.g. canonical-0.66.0-base);
+    # PRs onto them need the same format/lint/build/test gate as main.
+    branches: [main, "canonical-*"]
   workflow_dispatch:
 
 permissions:
